@@ -15,6 +15,15 @@ class ARM64Simulator {
             stack: { start: 0x07FF0000n, end: 0x07FFFFFFn, name: 'Stack', readonly: false }
         };
         
+        // Initialize region used size tracking
+        this.regionUsedSize = {
+            rodata: 0n,
+            data: 0n,
+            bss: 0n,
+            heap: 0n,
+            stack: 0n
+        };
+        
         // Calculate 16-byte aligned initial SP (highest address <= STACK_END that is 16-byte aligned)
         const STACK_END = this.memoryLayout.stack.end;
         const initialSp = (STACK_END + 1n) & ~0xFn; // Align to 16 bytes
@@ -26,7 +35,6 @@ class ARM64Simulator {
             x16: 0n, x17: 0n, x18: 0n, x19: 0n, x20: 0n, x21: 0n, x22: 0n, x23: 0n,
             x24: 0n, x25: 0n, x26: 0n, x27: 0n, x28: 0n, x29: 0n, x30: 0n,
             sp: initialSp,  // Initial stack pointer (16-byte aligned)
-            lr: 0n,
             pc: 0n
         };
 
@@ -36,10 +44,29 @@ class ARM64Simulator {
         // Heap allocator (bump pointer)
         this.heapPtr = 0x00400000n;
         
-        // Labels for ADR/ADRP resolution
-        this.labels = new Map();
+        // Symbol table: label name -> {address, section, type}
+        this.symbolTable = new Map();
         
-        // Program instructions
+        // Section location counters
+        this.sectionCounters = {
+            rodata: this.memoryLayout.rodata.start,
+            data: this.memoryLayout.data.start,
+            bss: this.memoryLayout.bss.start,
+            text: 0x00000000n  // Code starts at 0x00000000
+        };
+        
+        // Current section being processed
+        this.currentSection = 'text';
+        
+        // NZCV flags (Negative, Zero, Carry, oVerflow)
+        this.flags = {
+            N: false,  // Negative
+            Z: false,  // Zero
+            C: false,  // Carry
+            V: false   // oVerflow
+        };
+        
+        // Program instructions with addresses
         this.instructions = [];
         this.currentInstructionIndex = 0;
         
@@ -57,18 +84,148 @@ class ARM64Simulator {
     }
 
     loadProgram(assemblyCode) {
+        // Initialize parser
+        if (!this.parser) {
+            this.parser = new ARM64Parser(this);
+        }
+        
+        // Split into lines and filter empty/comments
         const lines = assemblyCode.split('\n')
             .map(line => line.trim())
-            .filter(line => line.length > 0 && !line.startsWith('//') && !line.startsWith(';'));
+            .filter(line => {
+                const trimmed = line.trim();
+                return trimmed.length > 0 && 
+                       !trimmed.startsWith('//') && 
+                       !trimmed.startsWith(';') &&
+                       trimmed !== '';
+            });
         
-        this.instructions = lines.map((line, index) => ({
-            original: line,
-            index: index,
-            parsed: this.parseInstruction(line)
-        }));
+        // First pass: build symbol table
+        const { symbolTable, sectionCounters } = this.parser.buildSymbolTable(lines);
+        this.symbolTable = symbolTable;
+        this.sectionCounters = sectionCounters;
         
-        this.currentInstructionIndex = 0;
-        this.registers.pc = 0n;
+        // Second pass: parse instructions and directives
+        const { instructions, dataInitializations } = this.parser.parseProgram(lines, symbolTable);
+        this.instructions = instructions;
+        
+        // Initialize memory regions with data BEFORE execution
+        this.initializeMemoryRegions(dataInitializations);
+        
+        // Find entry point: check for .global _start or .global main, then _start, then main, then first instruction
+        let entryPoint = 0x00000000n;
+        let entryLabel = null;
+        
+        // First, check for .global _start or .global main (priority order: _start, then main)
+        for (const [labelName, labelInfo] of symbolTable.entries()) {
+            if (labelInfo.isGlobal) {
+                if (labelName === '_start') {
+                    entryPoint = labelInfo.address;
+                    entryLabel = '_start';
+                    break; // _start has highest priority
+                } else if (labelName === 'main' && !entryLabel) {
+                    entryPoint = labelInfo.address;
+                    entryLabel = 'main';
+                }
+            }
+        }
+        
+        // If no .global found, check for _start or main labels (non-global)
+        if (!entryLabel) {
+            if (symbolTable.has('_start')) {
+                entryPoint = symbolTable.get('_start').address;
+                entryLabel = '_start';
+            } else if (symbolTable.has('main')) {
+                entryPoint = symbolTable.get('main').address;
+                entryLabel = 'main';
+            } else if (instructions.length > 0) {
+                // Fall back to first instruction
+                entryPoint = instructions[0].address;
+            }
+        }
+        
+        // Find the instruction at the entry point address
+        // The label address points to where the first instruction after the label is placed
+        // We need to find the FIRST instruction at or after the entry point address
+        let foundIndex = -1;
+        for (let i = 0; i < instructions.length; i++) {
+            if (instructions[i].address >= entryPoint) {
+                foundIndex = i;
+                entryPoint = instructions[i].address; // Use actual instruction address
+                break;
+            }
+        }
+        
+        // If no instruction found at or after entry point, use first instruction
+        if (foundIndex === -1 && instructions.length > 0) {
+            foundIndex = 0;
+            entryPoint = instructions[0].address;
+        }
+        
+        // Ensure we have a valid instruction index
+        if (foundIndex >= 0 && foundIndex < instructions.length) {
+            this.currentInstructionIndex = foundIndex;
+        } else if (instructions.length > 0) {
+            this.currentInstructionIndex = 0;
+            entryPoint = instructions[0].address;
+        } else {
+            this.currentInstructionIndex = 0;
+        }
+        
+        // Set PC to the entry point (address of first instruction to execute)
+        // PC must point to the instruction that will be executed when step() is first called
+        // This is the instruction at currentInstructionIndex
+        this.registers.pc = entryPoint;
+        
+        // Force UI update to show initialized memory
+        if (window.simulatorUI) {
+            window.simulatorUI.updateDisplay();
+        }
+    }
+
+    findInstructionIndexByAddress(address) {
+        // Find the instruction at the exact address, or the first instruction at or after that address
+        const addr = BigInt(address);
+        for (let i = 0; i < this.instructions.length; i++) {
+            if (this.instructions[i].address === addr) {
+                return i;
+            }
+            // If we've passed the address, return the previous instruction (shouldn't happen if address is exact)
+            if (this.instructions[i].address > addr) {
+                return i > 0 ? i - 1 : 0;
+            }
+        }
+        // If no instruction found, return 0 (first instruction)
+        return 0;
+    }
+
+    initializeMemoryRegions(dataInitializations) {
+        // Track used size for each region
+        this.regionUsedSize = {
+            rodata: 0n,
+            data: 0n,
+            bss: 0n,
+            heap: 0n,
+            stack: 0n
+        };
+        
+        // Initialize BSS to zero (already done by reset, but ensure it's clear)
+        // Data initializations will write the actual values
+        // During initialization, we need to write to Rodata, so skip readonly check
+        for (const init of dataInitializations) {
+            this.writeMemory(init.address, init.value, init.size, true); // true = skip readonly check during init
+            
+            // Track used size for this region
+            const regionKey = init.section;
+            if (this.regionUsedSize.hasOwnProperty(regionKey)) {
+                const endAddr = init.address + BigInt(init.size);
+                const regionStart = this.memoryLayout[regionKey].start;
+                const usedSize = endAddr - regionStart;
+                if (usedSize > this.regionUsedSize[regionKey]) {
+                    this.regionUsedSize[regionKey] = usedSize;
+                }
+            }
+        }
     }
 
     parseInstruction(line) {
@@ -79,7 +236,13 @@ class ARM64Simulator {
 
         // Split by whitespace, but handle commas properly
         const parts = line.split(/\s+/).filter(p => p.length > 0);
-        const opcode = parts[0].toLowerCase();
+        let opcode = parts[0].toLowerCase();
+        
+        // Check for conditional branches (beq, bne, ble, etc.) - NO DOTS
+        // These are separate opcodes, not "b" with a condition
+        if (opcode.match(/^b(eq|ne|lt|le|gt|ge|lo|ls|hi|hs|mi|pl)$/)) {
+            // This is a conditional branch - keep as is
+        }
         
         const result = {
             opcode: opcode,
@@ -103,6 +266,7 @@ class ARM64Simulator {
 
             case 'add':
             case 'sub':
+            case 'subs':
                 // add sp, sp, #16
                 // sub sp, sp, #16
                 // Also support: sub sp, sp, 16 (without #)
@@ -129,8 +293,52 @@ class ARM64Simulator {
                 }
                 break;
 
+            case 'cmp':
+                // cmp x0, x1 or cmp x0, #5
+                if (parts.length >= 3) {
+                    const src1Str = parts[1].replace(/,/g, '').trim();
+                    result.src1 = this.parseRegister(src1Str);
+                    
+                    const src2 = parts.slice(2).join(' ').replace(/,/g, '').trim();
+                    if (src2.startsWith('#')) {
+                        // Immediate: cmp xN, #imm
+                        result.immediate = BigInt(src2.substring(1));
+                    } else {
+                        // Register: cmp xN, xM
+                        result.src2 = this.parseRegister(src2);
+                    }
+                } else {
+                    throw new Error(`Invalid cmp instruction: missing operands`);
+                }
+                break;
+
+            case 'b':
+                // b label (unconditional)
+                if (parts.length >= 2) {
+                    result.label = parts.slice(1).join(' ').trim();
+                }
+                break;
+
+            case 'bl':
+                // bl label
+                if (parts.length >= 2) {
+                    result.label = parts.slice(1).join(' ').trim();
+                }
+                break;
+
+            case 'cbz':
+            case 'cbnz':
+                // cbz x0, label
+                if (parts.length >= 3) {
+                    result.src = this.parseRegister(parts[1].replace(/,/g, '').trim());
+                    result.label = parts.slice(2).join(' ').trim();
+                }
+                break;
+
             case 'str':
                 // str x0, [sp, #8]
+                // str x0, [x1, x2] - register offset
+                // str x0, [x1, x2, lsl #3] - scaled offset
                 if (parts.length >= 3) {
                     result.src = this.parseRegister(parts[1]);
                     const memOp = parts.slice(2).join(' ');
@@ -138,15 +346,38 @@ class ARM64Simulator {
                     if (memMatch) {
                         const memParts = memMatch[1].split(',');
                         result.base = this.parseRegister(memParts[0].trim());
+                        
                         if (memParts.length > 1) {
-                            const offset = memParts[1].trim();
-                            if (offset.startsWith('#')) {
-                                result.offset = BigInt(offset.substring(1));
+                            const offsetPart = memParts[1].trim();
+                            
+                            // Check for scaled offset: x2, lsl #3
+                            const scaledMatch = offsetPart.match(/(\w+)\s*,\s*lsl\s*#(\d+)/i);
+                            if (scaledMatch) {
+                                result.offsetReg = this.parseRegister(scaledMatch[1]);
+                                result.shift = parseInt(scaledMatch[2]);
+                                result.offsetType = 'scaled';
+                            } else if (offsetPart.startsWith('#')) {
+                                // Immediate offset
+                                result.offset = BigInt(offsetPart.substring(1));
+                                result.offsetType = 'immediate';
                             } else {
-                                result.offset = BigInt(parseInt(offset));
+                                // Try register offset
+                                const regOffset = this.parseRegister(offsetPart);
+                                if (regOffset) {
+                                    result.offsetReg = regOffset;
+                                    result.offsetType = 'register';
+                                } else {
+                                    // Try as immediate without #
+                                    const numValue = parseInt(offsetPart);
+                                    if (!isNaN(numValue)) {
+                                        result.offset = BigInt(numValue);
+                                        result.offsetType = 'immediate';
+                                    }
+                                }
                             }
                         } else {
                             result.offset = 0n;
+                            result.offsetType = 'immediate';
                         }
                     }
                 }
@@ -154,6 +385,8 @@ class ARM64Simulator {
 
             case 'ldr':
                 // ldr x1, [sp, #8]
+                // ldr x1, [x0, x2] - register offset
+                // ldr x1, [x0, x2, lsl #3] - scaled offset
                 if (parts.length >= 3) {
                     result.dest = this.parseRegister(parts[1]);
                     const memOp = parts.slice(2).join(' ');
@@ -161,15 +394,38 @@ class ARM64Simulator {
                     if (memMatch) {
                         const memParts = memMatch[1].split(',');
                         result.base = this.parseRegister(memParts[0].trim());
+                        
                         if (memParts.length > 1) {
-                            const offset = memParts[1].trim();
-                            if (offset.startsWith('#')) {
-                                result.offset = BigInt(offset.substring(1));
+                            const offsetPart = memParts[1].trim();
+                            
+                            // Check for scaled offset: x2, lsl #3
+                            const scaledMatch = offsetPart.match(/(\w+)\s*,\s*lsl\s*#(\d+)/i);
+                            if (scaledMatch) {
+                                result.offsetReg = this.parseRegister(scaledMatch[1]);
+                                result.shift = parseInt(scaledMatch[2]);
+                                result.offsetType = 'scaled';
+                            } else if (offsetPart.startsWith('#')) {
+                                // Immediate offset
+                                result.offset = BigInt(offsetPart.substring(1));
+                                result.offsetType = 'immediate';
                             } else {
-                                result.offset = BigInt(parseInt(offset));
+                                // Try register offset
+                                const regOffset = this.parseRegister(offsetPart);
+                                if (regOffset) {
+                                    result.offsetReg = regOffset;
+                                    result.offsetType = 'register';
+                                } else {
+                                    // Try as immediate without #
+                                    const numValue = parseInt(offsetPart);
+                                    if (!isNaN(numValue)) {
+                                        result.offset = BigInt(numValue);
+                                        result.offsetType = 'immediate';
+                                    }
+                                }
                             }
                         } else {
                             result.offset = 0n;
+                            result.offsetType = 'immediate';
                         }
                     }
                 }
@@ -196,8 +452,17 @@ class ARM64Simulator {
                 break;
 
             default:
-                console.warn(`Unknown instruction: ${opcode}`);
-                return null;
+                // Check for conditional branches (beq, bne, ble, etc.) - NO DOTS
+                if (opcode.match(/^b(eq|ne|lt|le|gt|ge|lo|ls|hi|hs|mi|pl)$/)) {
+                    // Parse like unconditional branch: beq label
+                    if (parts.length >= 2) {
+                        result.label = parts.slice(1).join(' ').trim();
+                    }
+                } else {
+                    console.warn(`Unknown instruction: ${opcode}`);
+                    return null;
+                }
+                break;
         }
 
         return result;
@@ -234,8 +499,13 @@ class ARM64Simulator {
         const parsed = instruction.parsed;
         const opcode = parsed.opcode;
         
+        // Get instruction address for PC-relative operations
+        // PC should already be set to this address by step(), but use instruction.address as source of truth
+        const instructionAddress = instruction.address || this.registers.pc;
 
         try {
+            let pcModified = false;
+            
             switch (opcode) {
                 case 'mov':
                     this.executeMov(parsed);
@@ -244,7 +514,8 @@ class ARM64Simulator {
                     this.executeAdd(parsed);
                     break;
                 case 'sub':
-                    this.executeSub(parsed);
+                case 'subs':
+                    this.executeSub(parsed, opcode === 'subs');
                     break;
                 case 'str':
                     this.executeStr(parsed);
@@ -253,29 +524,58 @@ class ARM64Simulator {
                     this.executeLdr(parsed);
                     break;
                 case 'adr':
-                    this.executeAdr(parsed, instruction.index);
+                    this.executeAdr(parsed, instructionAddress);
                     break;
                 case 'adrp':
-                    this.executeAdrp(parsed, instruction.index);
+                    this.executeAdrp(parsed, instructionAddress);
+                    break;
+                case 'cmp':
+                    this.executeCmp(parsed);
+                    break;
+                case 'b':
+                    pcModified = this.executeB(parsed);
+                    break;
+                case 'bl':
+                    pcModified = this.executeBl(parsed);
                     break;
                 case 'ret':
-                    return false; // End of program
+                    pcModified = this.executeRet(parsed);
+                    if (!pcModified) return false; // End of program
+                    break;
+                case 'cbz':
+                case 'cbnz':
+                    pcModified = this.executeCbz(parsed, opcode);
+                    break;
                 default:
-                    throw new Error(`Unsupported instruction: ${opcode}`);
+                    // Check for conditional branches (beq, bne, ble, bge, etc.) - NO DOTS
+                    if (opcode.match(/^b(eq|ne|lt|le|gt|ge|lo|ls|hi|hs|mi|pl)$/)) {
+                        pcModified = this.executeConditionalBranch(parsed, opcode);
+                    } else {
+                        throw new Error(`Unsupported instruction: ${opcode}`);
+                    }
             }
-
-            // Update program counter
-            this.registers.pc = BigInt(this.currentInstructionIndex + 1);
+            
+            // Update PC (unless instruction modified it)
+            // After executing instruction at address N, PC should point to next instruction at N+4
+            if (!pcModified) {
+                // PC should now point to the next instruction (current + 4 bytes)
+                this.registers.pc = instructionAddress + 4n;
+                this.currentInstructionIndex = this.findInstructionIndexByAddress(this.registers.pc);
+            }
+            
             return true;
         } catch (error) {
-            // Re-throw the error so UI can display it
             throw error;
         }
     }
 
     getRegisterValue(reg) {
         if (typeof reg === 'string') {
-            // Special registers (sp, lr, pc)
+            // Special registers (sp, pc)
+            // Note: LR is x30, not a separate register
+            if (reg === 'lr') {
+                return this.registers.x30 || 0n;
+            }
             return this.registers[reg] || 0n;
         }
         if (reg && reg.type === 'x') {
@@ -297,7 +597,14 @@ class ARM64Simulator {
 
     setRegisterValue(reg, value) {
         if (typeof reg === 'string') {
-            // Special registers (sp, lr, pc)
+            // Special registers (sp, pc)
+            // Note: LR is x30, not a separate register
+            if (reg === 'lr') {
+                this.registers.x30 = value;
+                this.changedRegisters.add('x30');
+                this.changedRegisters.add('w30');
+                return;
+            }
             this.registers[reg] = value;
             this.changedRegisters.add(reg);
             return;
@@ -374,7 +681,7 @@ class ARM64Simulator {
         }
     }
 
-    executeSub(parsed) {
+    executeSub(parsed, setFlags = false) {
         if (!parsed.dest || !parsed.src1) {
             throw new Error(`Invalid sub instruction: missing destination or source register. Parsed: ${JSON.stringify(parsed)}`);
         }
@@ -418,6 +725,12 @@ class ARM64Simulator {
         } else {
             const result = val1 - val2;
             this.setRegisterValue(parsed.dest, result);
+            
+            // Update flags if subs
+            if (setFlags) {
+                const size = (parsed.dest && parsed.dest.type === 'w') ? 32 : 64;
+                this.updateFlags(result, size);
+            }
         }
     }
 
@@ -426,7 +739,18 @@ class ARM64Simulator {
         
         const value = this.getRegisterValue(parsed.src);
         const baseAddr = this.getRegisterValue(parsed.base);
-        const offset = parsed.offset || 0n;
+        
+        // Calculate effective address based on offset type
+        let offset = 0n;
+        if (parsed.offsetType === 'scaled') {
+            const regValue = this.getRegisterValue(parsed.offsetReg);
+            offset = regValue << BigInt(parsed.shift || 0);
+        } else if (parsed.offsetType === 'register') {
+            offset = this.getRegisterValue(parsed.offsetReg);
+        } else {
+            offset = parsed.offset || 0n;
+        }
+        
         const address = baseAddr + offset;
         
         // Determine size: if src is w register, store 32 bits, else 64 bits
@@ -441,7 +765,18 @@ class ARM64Simulator {
         if (!parsed.dest || !parsed.base) return;
         
         const baseAddr = this.getRegisterValue(parsed.base);
-        const offset = parsed.offset || 0n;
+        
+        // Calculate effective address based on offset type
+        let offset = 0n;
+        if (parsed.offsetType === 'scaled') {
+            const regValue = this.getRegisterValue(parsed.offsetReg);
+            offset = regValue << BigInt(parsed.shift || 0);
+        } else if (parsed.offsetType === 'register') {
+            offset = this.getRegisterValue(parsed.offsetReg);
+        } else {
+            offset = parsed.offset || 0n;
+        }
+        
         const address = baseAddr + offset;
         
         // Determine size: if dest is w register, load 32 bits, else 64 bits
@@ -476,12 +811,16 @@ class ARM64Simulator {
             throw new Error(`Memory access out of bounds: 0x${addr.toString(16)}`);
         }
         
-        // Check alignment
+        // Check alignment (ARM64 supports unaligned accesses, but warn for performance)
+        // Allow unaligned accesses but they may be slower in real hardware
+        // We'll allow them in the simulator for flexibility
         if (size === 8 && addr % 8n !== 0n) {
-            throw new Error(`Unaligned 8-byte access at 0x${addr.toString(16)}`);
+            // ARM64 supports unaligned 8-byte accesses, but warn
+            console.warn(`Unaligned 8-byte access at 0x${addr.toString(16)} (allowed but may be slower)`);
         }
         if (size === 4 && addr % 4n !== 0n) {
-            throw new Error(`Unaligned 4-byte access at 0x${addr.toString(16)}`);
+            // ARM64 supports unaligned 4-byte accesses
+            console.warn(`Unaligned 4-byte access at 0x${addr.toString(16)} (allowed but may be slower)`);
         }
         
         // Check region access
@@ -528,9 +867,36 @@ class ARM64Simulator {
         return region;
     }
 
-    writeMemory(address, value, size = 8) {
-        // Validate access
-        this.validateMemoryAccess(address, size, true);
+    writeMemory(address, value, size = 8, skipReadonlyCheck = false) {
+        // Validate access (but allow skipping readonly check during initialization)
+        if (!skipReadonlyCheck) {
+            this.validateMemoryAccess(address, size, true);
+        } else {
+            // Still validate bounds and other checks, but skip readonly
+            const addr = BigInt(address);
+            
+            // Check zero page access
+            if (addr === 0n || (addr < 0x00100000n && addr > 0n)) {
+                throw new Error(`Zero page access forbidden: 0x${addr.toString(16)}`);
+            }
+            
+            // Check bounds
+            if (addr < 0x00100000n || addr + BigInt(size - 1) > 0x07FFFFFFn) {
+                throw new Error(`Memory access out of bounds: 0x${addr.toString(16)}`);
+            }
+            
+            // Find region (but don't check readonly)
+            const region = this.getMemoryRegion(address);
+            if (!region) {
+                throw new Error(`Memory access to unmapped region: 0x${addr.toString(16)}`);
+            }
+            
+            // Check region bounds
+            const endAddr = addr + BigInt(size - 1);
+            if (endAddr > region.end) {
+                throw new Error(`Memory access crosses region boundary: 0x${addr.toString(16)} to 0x${endAddr.toString(16)}`);
+            }
+        }
         
         // Store value at address (size bytes)
         // ARM64 is little-endian
@@ -568,14 +934,27 @@ class ARM64Simulator {
         if (!instruction || !instruction.parsed) {
             // Skip invalid instructions
             this.currentInstructionIndex++;
+            // Update PC to next instruction
+            if (this.currentInstructionIndex < this.instructions.length) {
+                const nextInstruction = this.instructions[this.currentInstructionIndex];
+                this.registers.pc = nextInstruction.address || BigInt(this.currentInstructionIndex * 4);
+            }
             return true;
         }
         
-        // executeInstruction now throws errors instead of returning false
+        // CRITICAL: Set PC to the address of the CURRENT instruction BEFORE execution
+        // PC must hold the address of the instruction being executed, not the next one
+        // This is required for ARM64: PC points to the instruction currently being executed
+        const instructionAddress = instruction.address || BigInt(this.currentInstructionIndex * 4);
+        this.registers.pc = instructionAddress;
+        
+        // executeInstruction will:
+        // 1. Use instructionAddress for PC-relative operations (ADR, ADRP)
+        // 2. Update PC after execution (either +4 for next instruction, or branch target)
+        // 3. Update currentInstructionIndex based on the new PC
         this.executeInstruction(instruction);
         
-        // If we get here, instruction executed successfully
-        this.currentInstructionIndex++;
+        // currentInstructionIndex is already updated by executeInstruction
         return true;
     }
 
@@ -811,74 +1190,47 @@ class ARM64Simulator {
         return data;
     }
 
-    executeAdr(parsed, instructionIndex) {
+    executeAdr(parsed, instructionAddress) {
         if (!parsed.dest || !parsed.label) {
             throw new Error(`Invalid adr instruction: missing destination or label`);
         }
         
-        // Get label address (for now, use a placeholder - will implement label resolution)
-        // For now, treat label as an immediate offset
-        let labelAddr;
-        if (this.labels.has(parsed.label)) {
-            labelAddr = this.labels.get(parsed.label);
-        } else {
-            // Try to parse as immediate offset
-            const imm = parseInt(parsed.label);
-            if (!isNaN(imm)) {
-                // ADR: Xd = PC + signed_21_bit_immediate
-                const pc = BigInt(instructionIndex * 4); // Assume 4-byte instructions
-                labelAddr = pc + BigInt(imm);
-            } else {
-                throw new Error(`Label '${parsed.label}' not found`);
-            }
+        // Look up label in symbol table
+        if (!this.symbolTable.has(parsed.label)) {
+            throw new Error(`Label '${parsed.label}' not found`);
         }
         
-        // ADR formula: Xd = PC + signed_21_bit_immediate
-        const pc = BigInt(instructionIndex * 4);
-        const result = labelAddr; // For now, use label address directly
+        const labelInfo = this.symbolTable.get(parsed.label);
+        const labelAddr = labelInfo.address;
         
+        // ADR returns the exact absolute address of the label
         // Check bounds
-        if (result < 0x00100000n || result > 0x07FFFFFFn) {
-            throw new Error(`ADR result out of memory bounds: 0x${result.toString(16)}`);
+        if (labelAddr < 0x00100000n && labelAddr > 0n) {
+            throw new Error(`ADR result in zero page: 0x${labelAddr.toString(16)}`);
         }
         
-        this.setRegisterValue(parsed.dest, result);
+        this.setRegisterValue(parsed.dest, labelAddr);
     }
 
-    executeAdrp(parsed, instructionIndex) {
+    executeAdrp(parsed, instructionAddress) {
         if (!parsed.dest || !parsed.label) {
             throw new Error(`Invalid adrp instruction: missing destination or label`);
         }
         
-        // Get label address
-        let labelAddr;
-        if (this.labels.has(parsed.label)) {
-            labelAddr = this.labels.get(parsed.label);
-        } else {
-            // Try to parse as immediate offset
-            const imm = parseInt(parsed.label);
-            if (!isNaN(imm)) {
-                // ADRP: Xd = (PC & ~0xFFF) + (imm << 12)
-                const pc = BigInt(instructionIndex * 4);
-                const pageBase = pc & ~0xFFFn;
-                labelAddr = pageBase + (BigInt(imm) << 12n);
-            } else {
-                throw new Error(`Label '${parsed.label}' not found`);
-            }
+        // Look up label in symbol table
+        if (!this.symbolTable.has(parsed.label)) {
+            throw new Error(`Label '${parsed.label}' not found`);
         }
         
-        // ADRP formula: Xd = (PC & ~0xFFF) + (imm << 12)
-        const pc = BigInt(instructionIndex * 4);
-        const pageBase = pc & ~0xFFFn;
+        const labelInfo = this.symbolTable.get(parsed.label);
+        const labelAddr = labelInfo.address;
         
-        // Calculate page offset from label
-        const labelPageBase = labelAddr & ~0xFFFn;
-        const pageOffset = labelPageBase - (pc & ~0xFFFn);
-        const result = pageBase + pageOffset;
+        // ADRP returns the page-aligned address (upper 52 bits, lower 12 bits cleared)
+        const result = labelAddr & ~0xFFFn;
         
         // Check bounds
-        if (result < 0x00100000n || result > 0x07FFFFFFn) {
-            throw new Error(`ADRP result out of memory bounds: 0x${result.toString(16)}`);
+        if (result < 0x00100000n && result > 0n) {
+            throw new Error(`ADRP result in zero page: 0x${result.toString(16)}`);
         }
         
         this.setRegisterValue(parsed.dest, result);
@@ -906,9 +1258,212 @@ class ARM64Simulator {
         return oldPtr;
     }
 
+    // NZCV flag operations
+    updateFlags(result, size = 64) {
+        const mask = size === 64 ? 0xFFFFFFFFFFFFFFFFn : 0xFFFFFFFFn;
+        const signBit = size === 64 ? 63 : 31;
+        
+        this.flags.N = (result & (1n << BigInt(signBit))) !== 0n;
+        this.flags.Z = (result & mask) === 0n;
+        // C and V flags need more context (carry/overflow from operation)
+    }
+
+    // CMP instruction: compare two values and set flags
+    executeCmp(parsed) {
+        if (!parsed.src1) {
+            throw new Error(`Invalid cmp instruction: missing first operand`);
+        }
+        
+        const val1 = this.getRegisterValue(parsed.src1);
+        let val2;
+        
+        // Check for immediate first (cmp xN, #imm)
+        if (parsed.immediate !== undefined) {
+            val2 = parsed.immediate;
+        } else if (parsed.src2) {
+            // Register comparison (cmp xN, xM)
+            val2 = this.getRegisterValue(parsed.src2);
+        } else {
+            throw new Error(`Invalid cmp instruction: missing second operand (register or immediate)`);
+        }
+        
+        const result = val1 - val2;
+        const size = (parsed.src1 && parsed.src1.type === 'w') ? 32 : 64;
+        
+        // Set N and Z flags
+        const mask = size === 64 ? 0xFFFFFFFFFFFFFFFFn : 0xFFFFFFFFn;
+        const signBit = size === 64 ? 63 : 31;
+        
+        this.flags.N = (result & (1n << BigInt(signBit))) !== 0n;
+        this.flags.Z = (result & mask) === 0n;
+        
+        // C flag: no borrow (val1 >= val2 in unsigned sense)
+        this.flags.C = val1 >= val2;
+        
+        // V flag: signed overflow in subtraction
+        // Overflow occurs when subtracting two numbers with different signs produces a result
+        // that has a different sign than expected
+        // Specifically: V = (val1 is negative != val2 is negative) && (result is negative != val1 is negative)
+        const signMask = 1n << BigInt(signBit);
+        
+        const val1Negative = (val1 & signMask) !== 0n;
+        const val2Negative = (val2 & signMask) !== 0n;
+        const resultNegative = (result & signMask) !== 0n;
+        
+        // Overflow occurs when:
+        // - We're subtracting numbers with different signs (val1 negative != val2 negative)
+        // - AND the result has a different sign than val1 (result negative != val1 negative)
+        // This means: (val1Negative != val2Negative) && (resultNegative != val1Negative)
+        this.flags.V = (val1Negative !== val2Negative) && (resultNegative !== val1Negative);
+    }
+
+    toSigned(value, size) {
+        const mask = size === 64 ? 0xFFFFFFFFFFFFFFFFn : 0xFFFFFFFFn;
+        const signBit = size === 64 ? 63 : 31;
+        if ((value & (1n << BigInt(signBit))) !== 0n) {
+            // Negative
+            return value - (1n << BigInt(size));
+        }
+        return value;
+    }
+
+    // Branch instructions
+    executeB(parsed) {
+        if (!parsed.label) {
+            throw new Error(`Invalid b instruction: missing label`);
+        }
+        
+        if (!this.symbolTable.has(parsed.label)) {
+            throw new Error(`Label '${parsed.label}' not found`);
+        }
+        
+        const labelInfo = this.symbolTable.get(parsed.label);
+        this.registers.pc = labelInfo.address;
+        this.currentInstructionIndex = this.findInstructionIndexByAddress(this.registers.pc);
+        return true; // PC modified
+    }
+
+    executeConditionalBranch(parsed, opcode) {
+        if (!parsed.label) {
+            throw new Error(`Invalid ${opcode} instruction: missing label`);
+        }
+        
+        // Extract condition (e.g., "eq", "ne", "lt", "ge") - opcode is "beq", "bne", etc. (no dot)
+        const condition = opcode.substring(1); // Remove "b" from "beq" -> "eq"
+        
+        // Evaluate condition based on NZCV flags
+        let conditionMet = false;
+        
+        switch (condition) {
+            case 'eq': conditionMet = this.flags.Z; break;
+            case 'ne': conditionMet = !this.flags.Z; break;
+            case 'lt': conditionMet = this.flags.N !== this.flags.V; break;
+            case 'le': conditionMet = this.flags.Z || (this.flags.N !== this.flags.V); break;
+            case 'gt': conditionMet = !this.flags.Z && (this.flags.N === this.flags.V); break;
+            case 'ge': conditionMet = this.flags.N === this.flags.V; break;
+            case 'lo': conditionMet = !this.flags.C; break; // Unsigned <
+            case 'ls': conditionMet = !this.flags.C || this.flags.Z; break; // Unsigned <=
+            case 'hi': conditionMet = this.flags.C && !this.flags.Z; break; // Unsigned >
+            case 'hs': conditionMet = this.flags.C; break; // Unsigned >=
+            case 'mi': conditionMet = this.flags.N; break; // Negative
+            case 'pl': conditionMet = !this.flags.N; break; // Positive or zero
+            default:
+                throw new Error(`Unknown branch condition: ${condition}`);
+        }
+        
+        if (conditionMet) {
+            // Branch taken
+            if (!this.symbolTable.has(parsed.label)) {
+                throw new Error(`Label '${parsed.label}' not found`);
+            }
+            const labelInfo = this.symbolTable.get(parsed.label);
+            this.registers.pc = labelInfo.address;
+            this.currentInstructionIndex = this.findInstructionIndexByAddress(this.registers.pc);
+            return true; // PC modified
+        } else {
+            // Branch not taken, fall through
+            return false; // PC will be incremented normally
+        }
+    }
+
+    executeCbz(parsed, opcode) {
+        if (!parsed.src || !parsed.label) {
+            throw new Error(`Invalid ${opcode} instruction: missing operands`);
+        }
+        
+        const value = this.getRegisterValue(parsed.src);
+        const isZero = value === 0n;
+        const shouldBranch = (opcode === 'cbz' && isZero) || (opcode === 'cbnz' && !isZero);
+        
+        if (shouldBranch) {
+            if (!this.symbolTable.has(parsed.label)) {
+                throw new Error(`Label '${parsed.label}' not found`);
+            }
+            const labelInfo = this.symbolTable.get(parsed.label);
+            this.registers.pc = labelInfo.address;
+            this.currentInstructionIndex = this.findInstructionIndexByAddress(this.registers.pc);
+            return true; // PC modified
+        }
+        
+        return false; // PC will be incremented normally
+    }
+
+    executeBl(parsed) {
+        if (!parsed.label) {
+            throw new Error(`Invalid bl instruction: missing label`);
+        }
+        
+        if (!this.symbolTable.has(parsed.label)) {
+            throw new Error(`Label '${parsed.label}' not found`);
+        }
+        
+        // Save return address (PC + 4) in x30 (LR is x30, not a separate register)
+        const returnAddress = this.registers.pc + 4n;
+        this.setRegisterValue({ type: 'x', num: 30, name: 'x30' }, returnAddress);
+        
+        // Jump to label
+        const labelInfo = this.symbolTable.get(parsed.label);
+        this.registers.pc = labelInfo.address;
+        this.currentInstructionIndex = this.findInstructionIndexByAddress(this.registers.pc);
+        return true; // PC modified
+    }
+
+    executeRet(parsed) {
+        // ret returns to address in x30 (LR is x30, not a separate register)
+        // If ret Xn is specified, use that register instead
+        if (parsed.src) {
+            const retAddr = this.getRegisterValue(parsed.src);
+            this.registers.pc = retAddr;
+        } else {
+            // Default: use x30 (LR)
+            const retAddr = this.getRegisterValue({ type: 'x', num: 30, name: 'x30' });
+            this.registers.pc = retAddr;
+        }
+        
+        this.currentInstructionIndex = this.findInstructionIndexByAddress(this.registers.pc);
+        
+        // Check if we've reached end of program
+        if (this.currentInstructionIndex >= this.instructions.length || this.registers.pc === 0n) {
+            return false; // End of program
+        }
+        
+        return true; // PC modified
+    }
+
     getAllMemoryRegions() {
         const regions = {};
         const allAddresses = Array.from(this.memory.keys());
+        
+        // Ensure regionUsedSize is initialized
+        if (!this.regionUsedSize) {
+            this.regionUsedSize = {
+                rodata: 0n,
+                data: 0n,
+                bss: 0n,
+                heap: 0n,
+                stack: 0n
+            };
+        }
         
         for (const [key, region] of Object.entries(this.memoryLayout)) {
             const regionData = [];
@@ -921,29 +1476,101 @@ class ARM64Simulator {
             );
             
             if (regionAddresses.length > 0) {
-                // Group into 8-byte aligned entries
-                const entryMap = new Map();
-                for (const addr of regionAddresses) {
-                    const alignedAddr = Math.floor(addr / 8) * 8;
-                    if (!entryMap.has(alignedAddr)) {
-                        entryMap.set(alignedAddr, alignedAddr);
-                    }
-                }
+                // Collect all memory entries, reading at their natural alignment
+                const processedAddrs = new Set();
                 
-                for (const addr of entryMap.keys()) {
-                    try {
-                        const value = this.readMemory(BigInt(addr));
+                for (const addr of regionAddresses) {
+                    if (processedAddrs.has(addr)) continue;
+                    
+                    // Determine the size of the value at this address
+                    // Try to read as 8-byte, 4-byte, 2-byte, or 1-byte
+                    let value = null;
+                    let size = 1;
+                    
+                    // Check if this is the start of an 8-byte value
+                    if (addr % 8 === 0 && addr + 7 <= regionEnd) {
+                        try {
+                            value = this.readMemory(BigInt(addr), 8);
+                            size = 8;
+                            for (let i = 0; i < 8; i++) processedAddrs.add(addr + i);
+                        } catch (e) {
+                            // Try smaller
+                        }
+                    }
+                    
+                    // Check if this is the start of a 4-byte value
+                    if (value === null && addr % 4 === 0 && addr + 3 <= regionEnd) {
+                        try {
+                            value = this.readMemory(BigInt(addr), 4);
+                            size = 4;
+                            for (let i = 0; i < 4; i++) processedAddrs.add(addr + i);
+                        } catch (e) {
+                            // Try smaller
+                        }
+                    }
+                    
+                    // Check if this is the start of a 2-byte value
+                    if (value === null && addr % 2 === 0 && addr + 1 <= regionEnd) {
+                        try {
+                            value = this.readMemory(BigInt(addr), 2);
+                            size = 2;
+                            for (let i = 0; i < 2; i++) processedAddrs.add(addr + i);
+                        } catch (e) {
+                            // Try 1-byte
+                        }
+                    }
+                    
+                    // Try 1-byte
+                    if (value === null) {
+                        try {
+                            value = this.readMemory(BigInt(addr), 1);
+                            size = 1;
+                            processedAddrs.add(addr);
+                        } catch (e) {
+                            // Skip this address
+                            continue;
+                        }
+                    }
+                    
+                    if (value !== null) {
                         regionData.push({
                             address: addr,
-                            value: value
+                            value: value,
+                            size: size
                         });
-                    } catch (e) {
-                        // Skip invalid
                     }
                 }
                 
                 regionData.sort((a, b) => a.address - b.address);
             }
+            
+            // Calculate used size for this region
+            let usedSize = 0n;
+            if (regionData.length > 0) {
+                const lastEntry = regionData[regionData.length - 1];
+                const lastAddr = BigInt(lastEntry.address) + BigInt(lastEntry.size);
+                usedSize = lastAddr - BigInt(regionStart);
+            } else if (this.regionUsedSize && this.regionUsedSize[key]) {
+                // Use tracked used size if available (for BSS, etc.)
+                usedSize = this.regionUsedSize[key];
+            }
+            
+            // For stack, calculate used size based on SP position
+            if (key === 'stack') {
+                const stackTop = BigInt(regionEnd) + 1n;
+                const currentSp = this.registers.sp;
+                if (currentSp < stackTop) {
+                    usedSize = stackTop - currentSp;
+                }
+            }
+            
+            // For heap, use tracked heap pointer
+            if (key === 'heap' && this.heapPtr > BigInt(regionStart)) {
+                usedSize = this.heapPtr - BigInt(regionStart);
+            }
+            
+            // Calculate total size correctly (regionEnd and regionStart are Numbers, so convert back to BigInt for calculation)
+            const totalSizeBigInt = BigInt(regionEnd) - BigInt(regionStart) + 1n;
             
             regions[key] = {
                 name: region.name,
@@ -951,7 +1578,9 @@ class ARM64Simulator {
                 end: regionEnd,
                 readonly: region.readonly,
                 data: regionData,
-                isEmpty: regionData.length === 0
+                isEmpty: regionData.length === 0,
+                usedSize: Number(usedSize),
+                totalSize: Number(totalSizeBigInt)
             };
         }
         

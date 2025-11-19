@@ -43,8 +43,15 @@ class SimulatorUI {
             this.updateStatus('Program loaded');
             this.highlightCurrentInstruction();
         } catch (error) {
+            console.error('Error loading program:', error);
             alert(`Error loading program: ${error.message}`);
             this.updateStatus(`Error: ${error.message}`);
+            // Still try to update display in case partial data was loaded
+            try {
+                this.updateDisplay();
+            } catch (e) {
+                console.error('Error updating display:', e);
+            }
         }
     }
 
@@ -244,14 +251,32 @@ class SimulatorUI {
     updateMemory() {
         this.memoryVisualization.innerHTML = '';
         
-        const regions = this.simulator.getAllMemoryRegions();
-        const regionOrder = ['rodata', 'data', 'bss', 'heap', 'stack'];
+        let regions;
+        try {
+            regions = this.simulator.getAllMemoryRegions();
+        } catch (error) {
+            console.error('Error getting memory regions:', error);
+            this.updateStatus(`Error getting memory regions: ${error.message}`);
+            // Return empty regions object so UI doesn't break
+            regions = {};
+        }
+        
+        // Order: Stack, Heap, BSS, Data, Rodata (left to right)
+        const regionOrder = ['stack', 'heap', 'bss', 'data', 'rodata'];
         
         // Render horizontal memory map overview
         this.renderMemoryMapOverview(regions, regionOrder);
         
-        // Render detailed stack visualization below
-        this.renderStackDetails(regions.stack);
+        // Render stack frame visualization below the memory map (integrated, not separate)
+        if (regions.stack) {
+            const stackDetailsContainer = document.createElement('div');
+            stackDetailsContainer.className = 'stack-details-integrated';
+            const stackContent = document.createElement('div');
+            stackContent.className = 'stack-details-content';
+            this.renderStackRegion(stackContent, regions.stack);
+            stackDetailsContainer.appendChild(stackContent);
+            this.memoryVisualization.appendChild(stackDetailsContainer);
+        }
     }
 
     renderMemoryMapOverview(regions, regionOrder) {
@@ -266,23 +291,20 @@ class SimulatorUI {
         const mapContainer = document.createElement('div');
         mapContainer.className = 'memory-map-container';
         
-        // Calculate total memory size for proportional widths
-        const totalSize = regionOrder.reduce((sum, key) => {
-            const region = regions[key];
-            return sum + (region ? (region.end - region.start + 1) : 0);
-        }, 0);
+        // All regions get equal width (same width, only heights vary)
+        const equalWidthPercent = 100 / regionOrder.length;
         
         regionOrder.forEach(regionKey => {
             const region = regions[regionKey];
-            if (!region) return;
-            
-            const regionSize = region.end - region.start + 1;
-            const widthPercent = (regionSize / totalSize) * 100;
+            if (!region) {
+                console.warn(`Region ${regionKey} not found in regions object`);
+                return;
+            }
             
             const regionRect = document.createElement('div');
             regionRect.className = `memory-region-rect ${regionKey}`;
-            regionRect.style.width = `${widthPercent}%`;
-            regionRect.style.minWidth = '80px';
+            regionRect.style.width = `${equalWidthPercent}%`; // Equal width for all
+            regionRect.style.flexShrink = 0; // Prevent wrapping
             
             const regionName = document.createElement('div');
             regionName.className = 'region-rect-name';
@@ -294,8 +316,29 @@ class SimulatorUI {
             
             const regionInfo = document.createElement('div');
             regionInfo.className = 'region-rect-info';
-            if (!region.isEmpty) {
-                regionInfo.textContent = `${region.data.length} entries`;
+            if (!region.isEmpty && region.data.length > 0) {
+                // Show all elements in format "address:value", one per line
+                const elements = region.data.map(entry => {
+                    const addrStr = `0x${entry.address.toString(16).toUpperCase()}`;
+                    // Format value based on size
+                    let valueStr;
+                    if (entry.size === 1) {
+                        valueStr = `0x${entry.value.toString(16).toUpperCase().padStart(2, '0')}`;
+                    } else if (entry.size === 2) {
+                        valueStr = `0x${entry.value.toString(16).toUpperCase().padStart(4, '0')}`;
+                    } else if (entry.size === 4) {
+                        valueStr = `0x${entry.value.toString(16).toUpperCase().padStart(8, '0')}`;
+                    } else {
+                        valueStr = `0x${entry.value.toString(16).toUpperCase().padStart(16, '0')}`;
+                    }
+                    return `${addrStr}:${valueStr}`;
+                });
+                regionInfo.innerHTML = elements.join('<br>');
+                regionInfo.style.fontSize = '9px';
+                regionInfo.style.overflowY = 'auto';
+                regionInfo.style.maxHeight = '100px';
+                regionInfo.style.textAlign = 'left';
+                regionInfo.style.padding = '4px';
             } else {
                 regionInfo.textContent = 'empty';
             }
