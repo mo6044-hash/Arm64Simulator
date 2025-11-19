@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ARM64 Assembly Simulator</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>ARM64 Assembly Simulator</h1>
+        </header>
+
+        <div class="main-content">
+            <!-- Assembly Input Pane -->
+            <div class="pane assembly-pane">
+                <div class="pane-header">
+                    <h2>Assembly Code</h2>
+                    <button id="loadBtn" class="btn btn-primary">Load</button>
+                </div>
+                <textarea id="assemblyInput" class="code-editor" placeholder="Enter ARM64 assembly code here...&#10;&#10;Example:&#10;mov x0, #5&#10;sub sp, sp, #16&#10;str x0, [sp, #8]&#10;ldr x1, [sp, #8]&#10;add sp, sp, #16&#10;ret"></textarea>
+            </div>
+
+            <!-- Controls -->
+            <div class="pane controls-pane">
+                <div class="pane-header">
+                    <h2>Execution Controls</h2>
+                </div>
+                <div class="controls">
+                    <button id="stepBtn" class="btn btn-action">Step</button>
+                    <button id="runBtn" class="btn btn-action">Run</button>
+                    <button id="pauseBtn" class="btn btn-action" disabled>Pause</button>
+                    <button id="resetBtn" class="btn btn-action">Reset</button>
+                </div>
+                <div class="status">
+                    <div id="statusText" class="status-text">Ready</div>
+                    <div id="currentInstruction" class="current-instruction"></div>
+                </div>
+            </div>
+
+            <!-- CPU State Display -->
+            <div class="pane cpu-pane">
+                <div class="pane-header">
+                    <h2>CPU Registers</h2>
+                </div>
+                <div id="registersDisplay" class="registers-grid"></div>
+            </div>
+
+            <!-- Memory and Stack Visualization -->
+            <div class="pane memory-pane">
+                <div class="pane-header">
+                    <h2>Memory Regions</h2>
+                </div>
+                <div id="memoryVisualization" class="memory-visualization"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="simulator.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
+
