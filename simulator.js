@@ -3,6 +3,15 @@
 class ARM64Simulator {
     constructor() {
         this.reset();
+        // I/O callbacks for built-in functions
+        this.ioCallbacks = {
+            output: null,      // Function to output text
+            inputSync: null    // Function to get input synchronously (returns string)
+        };
+    }
+    
+    setIOCallbacks(callbacks) {
+        this.ioCallbacks = callbacks;
     }
 
     reset() {
@@ -150,14 +159,44 @@ class ARM64Simulator {
         }
         
         // Find the instruction at the entry point address
-        // The label address points to where the first instruction after the label is placed
-        // We need to find the FIRST instruction at or after the entry point address
+        // The label address points to where the first instruction after the label will be placed
+        // We need to find the instruction that matches this address exactly, or the first one after it
         let foundIndex = -1;
-        for (let i = 0; i < instructions.length; i++) {
-            if (instructions[i].address >= entryPoint) {
-                foundIndex = i;
-                entryPoint = instructions[i].address; // Use actual instruction address
-                break;
+        
+        // If we have an entry label, find the first instruction at that label's address
+        if (entryLabel && symbolTable.has(entryLabel)) {
+            const labelInfo = symbolTable.get(entryLabel);
+            const labelAddr = labelInfo.address;
+            
+            // Find the instruction that matches the label address exactly
+            // The label address should match the address of the first instruction after it
+            for (let i = 0; i < instructions.length; i++) {
+                if (instructions[i].address === labelAddr) {
+                    foundIndex = i;
+                    entryPoint = instructions[i].address;
+                    break;
+                }
+            }
+            
+            // If no exact match, find first instruction at or after the label address
+            // This handles edge cases where label address might be slightly off
+            if (foundIndex === -1) {
+                for (let i = 0; i < instructions.length; i++) {
+                    if (instructions[i].address >= labelAddr) {
+                        foundIndex = i;
+                        entryPoint = instructions[i].address; // Use actual instruction address
+                        break;
+                    }
+                }
+            }
+        } else {
+            // No entry label, find instruction at or after entry point
+            for (let i = 0; i < instructions.length; i++) {
+                if (instructions[i].address >= entryPoint) {
+                    foundIndex = i;
+                    entryPoint = instructions[i].address; // Use actual instruction address
+                    break;
+                }
             }
         }
         
@@ -170,17 +209,21 @@ class ARM64Simulator {
         // Ensure we have a valid instruction index
         if (foundIndex >= 0 && foundIndex < instructions.length) {
             this.currentInstructionIndex = foundIndex;
+            entryPoint = instructions[foundIndex].address; // Always use the actual instruction address
         } else if (instructions.length > 0) {
+            // Fallback: use first instruction
             this.currentInstructionIndex = 0;
             entryPoint = instructions[0].address;
         } else {
             this.currentInstructionIndex = 0;
         }
         
-        // Set PC to the entry point (address of first instruction to execute)
+        // CRITICAL: Set PC to the entry point (address of first instruction to execute)
         // PC must point to the instruction that will be executed when step() is first called
         // This is the instruction at currentInstructionIndex
+        // step() will set PC to the instruction address before executing, so we need to set it here
         this.registers.pc = entryPoint;
+        
         
         // Store entry point address and label to detect when RET is called from _start/main
         this.entryPointAddress = entryPoint;
@@ -285,12 +328,13 @@ class ARM64Simulator {
         switch (opcode) {
             case 'mov':
                 // mov x0, #5
+                // mov x0, #-1
                 // mov x0, x1
                 if (parts.length >= 3) {
                     result.dest = this.parseRegister(parts[1]);
                     const src = parts.slice(2).join(' ');
                     if (src.startsWith('#')) {
-                        result.immediate = BigInt(src.substring(1));
+                        result.immediate = this.parseImmediate(src.substring(1));
                     } else {
                         result.src = this.parseRegister(src);
                     }
@@ -316,7 +360,17 @@ class ARM64Simulator {
                     // Get the immediate value or second source
                     const src2 = parts.slice(3).join(' ').replace(/,/g, '').trim();
                     if (src2.startsWith('#')) {
-                        result.immediate = BigInt(src2.substring(1));
+                        result.immediate = this.parseImmediate(src2.substring(1));
+                    } else if (src2.includes(':lo12:')) {
+                        // Handle :lo12: syntax: add x0, x0, :lo12:label
+                        // This is assembler syntax for the low 12 bits of a label address
+                        const labelMatch = src2.match(/:lo12:([a-zA-Z_][a-zA-Z0-9_]*)/);
+                        if (labelMatch) {
+                            result.label = labelMatch[1];
+                            result.labelOp = 'lo12'; // Mark this as a lo12 operation
+                        } else {
+                            throw new Error(`Invalid :lo12: syntax: ${src2}`);
+                        }
                     } else {
                         // Try to parse as number (immediate without #)
                         const numValue = parseInt(src2);
@@ -340,7 +394,7 @@ class ARM64Simulator {
                     const src2 = parts.slice(2).join(' ').replace(/,/g, '').trim();
                     if (src2.startsWith('#')) {
                         // Immediate: cmp xN, #imm or cmn xN, #imm
-                        result.immediate = BigInt(src2.substring(1));
+                        result.immediate = this.parseImmediate(src2.substring(1));
                     } else {
                         // Register: cmp xN, xM or cmn xN, xM
                         result.src2 = this.parseRegister(src2);
@@ -375,7 +429,7 @@ class ARM64Simulator {
                         result.shiftAmount = parseInt(shiftedMatch[3]);
                     } else if (src2Part.startsWith('#')) {
                         // Immediate: and x0, x1, #0xFF
-                        result.immediate = BigInt(src2Part.substring(1));
+                        result.immediate = this.parseImmediate(src2Part.substring(1));
                     } else {
                         // Register: and x0, x1, x2
                         result.src2 = this.parseRegister(src2Part);
@@ -409,13 +463,7 @@ class ARM64Simulator {
                         const shiftPart = parts.slice(3).join(' ').replace(/,/g, '').trim();
                         if (shiftPart.startsWith('#')) {
                             // Immediate: lsl x0, x1, #4 or lsl x0, x1, #0xFF
-                            const immStr = shiftPart.substring(1);
-                            // Handle hex (0x) and decimal
-                            if (immStr.toLowerCase().startsWith('0x')) {
-                                result.immediate = BigInt(immStr);
-                            } else {
-                                result.immediate = BigInt(immStr);
-                            }
+                            result.immediate = this.parseImmediate(shiftPart.substring(1));
                         } else {
                             // Try to parse as number (immediate without #)
                             const numValue = parseInt(shiftPart);
@@ -586,6 +634,72 @@ class ARM64Simulator {
         return result;
     }
 
+    parseImmediate(immStr) {
+        // Parse immediate value, handling negative numbers, hex, and character literals
+        // immStr should be the string after '#' (e.g., "-1", "5", "0xFF", "'A'")
+        let isNegative = false;
+        let numStr = immStr.trim();
+        
+        // Check for character literal (e.g., 'A', 'B', '\n')
+        if (numStr.startsWith("'") && numStr.endsWith("'") && numStr.length >= 3) {
+            const charStr = numStr.slice(1, -1); // Remove quotes
+            let charCode;
+            
+            // Handle escape sequences
+            if (charStr.length === 2 && charStr[0] === '\\') {
+                switch (charStr[1]) {
+                    case 'n':
+                        charCode = 10; // newline
+                        break;
+                    case 't':
+                        charCode = 9; // tab
+                        break;
+                    case '\\':
+                        charCode = 92; // backslash
+                        break;
+                    case '\'':
+                        charCode = 39; // single quote
+                        break;
+                    case '"':
+                        charCode = 34; // double quote
+                        break;
+                    case '0':
+                        charCode = 0; // null
+                        break;
+                    default:
+                        throw new Error(`Unknown escape sequence: \\${charStr[1]}`);
+                }
+            } else if (charStr.length === 1) {
+                charCode = charStr.charCodeAt(0);
+            } else {
+                throw new Error(`Invalid character literal: ${numStr}`);
+            }
+            
+            return BigInt(charCode);
+        }
+        
+        // Check for negative sign
+        if (numStr.startsWith('-')) {
+            isNegative = true;
+            numStr = numStr.substring(1);
+        }
+        
+        // Parse the number (handles hex 0x prefix)
+        let value;
+        if (numStr.toLowerCase().startsWith('0x')) {
+            value = BigInt(numStr);
+        } else {
+            value = BigInt(numStr);
+        }
+        
+        // Apply negative if needed
+        if (isNegative) {
+            value = -value;
+        }
+        
+        return value;
+    }
+
     parseRegister(regStr) {
         regStr = regStr.trim().toLowerCase();
         if (regStr === 'sp') return 'sp';
@@ -606,7 +720,7 @@ class ARM64Simulator {
         return null;
     }
 
-    executeInstruction(instruction) {
+    async executeInstruction(instruction) {
         if (!instruction || !instruction.parsed) {
             return false;
         }
@@ -676,7 +790,7 @@ class ARM64Simulator {
                     pcModified = this.executeB(parsed);
                     break;
                 case 'bl':
-                    pcModified = this.executeBl(parsed);
+                    pcModified = await this.executeBl(parsed);
                     break;
                 case 'ret':
                     pcModified = this.executeRet(parsed);
@@ -771,11 +885,187 @@ class ARM64Simulator {
         }
     }
 
+    countBits(n) {
+        // Count the number of bits set in a BigInt (up to 64 bits)
+        let count = 0;
+        let val = n;
+        while (val > 0n) {
+            if ((val & 1n) !== 0n) {
+                count++;
+            }
+            val = val >> 1n;
+        }
+        return count;
+    }
+
+    isMovImmediateEncodable(value, is64Bit) {
+        // Check if an immediate value can be encoded using MOVZ or MOVN
+        // For 64-bit: shifts are 0, 16, 32, 48
+        // For 32-bit: shifts are 0, 16
+        // MOVZ: (16-bit_value << shift) where only that 16-bit chunk is non-zero
+        // MOVN: ~((16-bit_value << shift)) where only that 16-bit chunk is set in notValue
+        
+        const mask64 = 0xFFFFFFFFFFFFFFFFn;
+        const mask32 = 0xFFFFFFFFn;
+        const mask = is64Bit ? mask64 : mask32;
+        
+        // Convert to unsigned representation
+        let unsignedValue = value & mask;
+        
+        // Quick rejection: If the value has more than 16 bits set and doesn't match
+        // a simple pattern, it likely spans multiple chunks incorrectly
+        // Count set bits - if it's more than 16 and not all bits, it's suspicious
+        // (This is a heuristic to catch obvious cases like 0xFFFFFFFFFFFFF)
+        
+        // Check for MOVZ pattern: (16-bit_value << shift)
+        // The value must have bits set in ONLY ONE 16-bit aligned chunk
+        const shifts = is64Bit ? [0, 16, 32, 48] : [0, 16];
+        for (const shift of shifts) {
+            // Extract the 16-bit value at this shift position
+            const shiftedMask = (0xFFFFn << BigInt(shift)) & mask;
+            const extracted = (unsignedValue & shiftedMask) >> BigInt(shift);
+            
+            // Check if all other bits are zero (only this chunk has bits set)
+            const otherBits = unsignedValue & (~shiftedMask);
+            if (otherBits === 0n && extracted <= 0xFFFFn && extracted > 0n) {
+                return true; // Valid MOVZ encoding
+            }
+        }
+        
+        // Check for MOVN pattern: ~((16-bit_value << shift))
+        // This means: value = ~(16-bit_value << shift)
+        // Which means: ~value = (16-bit_value << shift)
+        // So ~value must have bits set in ONLY ONE 16-bit aligned chunk
+        const notValue = (~unsignedValue) & mask;
+        for (const shift of shifts) {
+            const shiftedMask = (0xFFFFn << BigInt(shift)) & mask;
+            const extracted = (notValue & shiftedMask) >> BigInt(shift);
+            const otherBits = notValue & (~shiftedMask);
+            
+            // For MOVN to be valid:
+            // 1. notValue must have bits set in ONLY ONE 16-bit chunk (otherBits === 0)
+            // 2. The extracted value must be exactly a 16-bit value (0x0000 to 0xFFFF)
+            // 3. When we reconstruct: (extracted << shift) must equal notValue exactly
+            // 4. The original value must match ~(extracted << shift) exactly
+            // 5. CRITICAL: The original value must have bits set in ALL chunks EXCEPT the one at shift
+            //    This ensures it's the NOT of a single shifted 16-bit value, not a value spanning multiple chunks
+            if (otherBits === 0n && extracted >= 0n && extracted <= 0xFFFFn && extracted > 0n) {
+                // Verify that reconstructing gives us the exact notValue
+                const reconstructed = (extracted << BigInt(shift)) & mask;
+                // Also verify that the original value matches ~reconstructed exactly
+                const originalReconstructed = (~reconstructed) & mask;
+                if (reconstructed === notValue && originalReconstructed === unsignedValue) {
+                    // Additional critical check: Verify that the original value has the correct pattern
+                    // For MOVN at shift N: all chunks except chunk N should be 0xFFFF (all 1s)
+                    // and chunk N should be ~extracted
+                    let isValidMovn = true;
+                    for (const checkShift of shifts) {
+                        const checkMask = (0xFFFFn << BigInt(checkShift)) & mask;
+                        const chunkValue = (unsignedValue & checkMask) >> BigInt(checkShift);
+                        if (checkShift === shift) {
+                            // At the shift position, the chunk should be the NOT of extracted
+                            const expectedChunk = (~extracted) & 0xFFFFn;
+                            if (chunkValue !== expectedChunk) {
+                                isValidMovn = false;
+                                break;
+                            }
+                            // CRITICAL: For MOVN, reject values where the chunk at shift is only partially set
+                            // This indicates the value spans more bits than can be encoded in a single 16-bit immediate
+                            // For example, 0xFFFFFFFFFFFFF has chunk 3 = 0x000F (only 4 bits), meaning it spans 52 bits
+                            // A single MOV can only encode 16 bits of information, so values spanning more should be rejected
+                            // Check: if the chunk value is not 0xFFFF and not a full 16-bit pattern starting from bit 0,
+                            // it means the value spans incorrectly
+                            // For 0x000F: this is only the lower 4 bits, not a full 16-bit pattern
+                            // Reject if chunkValue is not 0xFFFF and doesn't use the full lower 16 bits
+                            if (chunkValue !== 0xFFFFn) {
+                                // The chunk should be the NOT of extracted
+                                // If extracted = 0xFFF0, chunk = 0x000F
+                                // But 0x000F only uses 4 bits, meaning the original value spans 52 bits
+                                // Reject if the chunk doesn't use bits starting from 0 (i.e., it's not a contiguous pattern from 0)
+                                // For 0x000F: it uses bits 0-3, which is contiguous from 0, so that's not the issue
+                                // The real issue: 0x000F means only 4 bits are used in the chunk, but the value spans 52 bits total
+                                // A valid MOVN should have the chunk use the full 16-bit range when it's not all 1s
+                                // Actually, the simplest check: reject if chunkValue < 0xFFFF and the value has more than shift + 16 bits
+                                // But wait, that's what we're checking with expectedBits
+                                // The key insight: if chunkValue is 0x000F, it means only 4 bits are set in that chunk
+                                // But for a valid MOVN, if the chunk is not all 1s, it should still represent a full 16-bit NOT pattern
+                                // The issue is that 0x000F is the NOT of 0xFFF0, but 0xFFF0 is not a "standard" 16-bit immediate
+                                // Actually, I think the real rule is simpler: reject if the value cannot be represented
+                                // as ~(imm16 << shift) where imm16 is a valid 16-bit immediate
+                                // And 0xFFF0 IS a valid 16-bit immediate, so this should work
+                                // But ARM64 rejects it, so there must be another constraint
+                                // Let me check: maybe the issue is that the value spans 52 bits, which is more than 16
+                                // So the rule is: reject if totalBitsSet > 16 for the chunk at shift
+                                // But that doesn't make sense either, because MOVN can have up to 64 bits set
+                                // I think the real issue is that 0xFFFFFFFFFFFFF cannot be encoded because it requires
+                                // more than one instruction to construct. The value has 52 bits set, which is more than
+                                // the 16 bits that can be encoded in a single immediate field
+                                // Simple fix: reject if the chunk at shift has fewer than 16 bits set when it's not 0xFFFF
+                                // For 0x000F: only 4 bits are set, so reject
+                                const chunkBitsSet = this.countBits(chunkValue);
+                                if (chunkBitsSet < 16 && chunkValue !== 0n) {
+                                    isValidMovn = false;
+                                    break;
+                                }
+                            }
+                        } else {
+                            // At all other positions, the chunk should be all 1s (0xFFFF)
+                            // because we're NOT'ing a value that's 0 in those positions
+                            if (chunkValue !== 0xFFFFn) {
+                                isValidMovn = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (isValidMovn) {
+                        return true; // Valid MOVN encoding
+                    }
+                }
+            }
+        }
+        
+        return false; // Not encodable
+    }
+
     executeMov(parsed) {
         if (!parsed.dest) return;
         
         if (parsed.immediate !== undefined) {
-            this.setRegisterValue(parsed.dest, parsed.immediate);
+            // First, validate that the immediate can be encoded
+            const is64Bit = !(parsed.dest && parsed.dest.type === 'w');
+            const originalValue = parsed.immediate;
+            
+            // Convert to unsigned representation for validation
+            const mask = is64Bit ? 0xFFFFFFFFFFFFFFFFn : 0xFFFFFFFFn;
+            let value = originalValue;
+            if (value < 0n) {
+                value = value & mask; // Convert to two's complement
+            } else {
+                value = value & mask; // Mask to appropriate size
+            }
+            
+            // Check if the immediate is encodable
+            if (!this.isMovImmediateEncodable(value, is64Bit)) {
+                throw new Error(`MOV immediate value 0x${value.toString(16).toUpperCase()} cannot be encoded using MOVZ/MOVN. Valid immediates must be a 16-bit value shifted by 0, 16, 32, 48 (for 64-bit) or 0, 16 (for 32-bit), or their bitwise NOT.`);
+            }
+            
+            // Apply sign extension based on register type
+            if (parsed.dest && parsed.dest.type === 'w') {
+                // For W registers: 32-bit sign extension, then zero-extend to 64 bits
+                // Convert immediate to signed 32-bit integer, then zero-extend to 64 bits
+                const int32Value = Number(value);
+                // Convert to signed 32-bit (this handles sign extension)
+                const signed32 = (int32Value << 0) >> 0; // Sign-extend to 32 bits
+                // Convert to unsigned 32-bit representation (zero-extend)
+                const unsigned32 = signed32 >>> 0;
+                // Zero-extend to 64 bits (W register behavior)
+                value = BigInt(unsigned32);
+            } else {
+                // For X registers: value is already in correct 64-bit representation
+                // (already masked above)
+            }
+            
+            this.setRegisterValue(parsed.dest, value);
         } else if (parsed.src) {
             const srcValue = this.getRegisterValue(parsed.src);
             this.setRegisterValue(parsed.dest, srcValue);
@@ -792,6 +1082,15 @@ class ARM64Simulator {
         
         if (parsed.immediate !== undefined) {
             val2 = parsed.immediate;
+        } else if (parsed.labelOp === 'lo12' && parsed.label) {
+            // Handle :lo12: syntax - add the low 12 bits of label address
+            if (!this.symbolTable.has(parsed.label)) {
+                throw new Error(`Label '${parsed.label}' not found for :lo12:`);
+            }
+            const labelInfo = this.symbolTable.get(parsed.label);
+            const labelAddr = labelInfo.address;
+            // Extract low 12 bits (mask with 0xFFF)
+            val2 = labelAddr & 0xFFFn;
         } else if (parsed.src2) {
             val2 = this.getRegisterValue(parsed.src2);
         } else {
@@ -1255,7 +1554,7 @@ class ARM64Simulator {
         return value;
     }
 
-    step() {
+    async step() {
         if (this.currentInstructionIndex >= this.instructions.length) {
             return false;
         }
@@ -1283,7 +1582,7 @@ class ARM64Simulator {
         // 2. Update PC after execution (either +4 for next instruction, or branch target)
         // 3. Update currentInstructionIndex based on the new PC
         // 4. Return false if program should end (e.g., ret from _start/main)
-        const shouldContinue = this.executeInstruction(instruction);
+        const shouldContinue = await this.executeInstruction(instruction);
         if (!shouldContinue) {
             // Program ended
             return false;
@@ -1876,11 +2175,29 @@ class ARM64Simulator {
         return false; // PC will be incremented normally
     }
 
-    executeBl(parsed) {
+    async executeBl(parsed) {
         if (!parsed.label) {
             throw new Error(`Invalid bl instruction: missing label`);
         }
         
+        // Check if this is a built-in I/O function
+        const builtInFunctions = ['printf', 'puts', 'putchar', 'scanf', 'gets', 'fgets', 'getchar'];
+        if (builtInFunctions.includes(parsed.label)) {
+            // BL must store the return address (PC + 4) in x30 (LR)
+            const returnAddress = this.registers.pc + 4n;
+            this.setRegisterValue({ type: 'x', num: 30, name: 'x30' }, returnAddress);
+            
+            // Execute the built-in function (async for input functions)
+            await this.executeBuiltInFunctionSync(parsed.label);
+            
+            // Return to caller (simulate RET)
+            this.registers.pc = returnAddress;
+            this.currentInstructionIndex = this.findInstructionIndexByAddress(this.registers.pc);
+            
+            return true; // PC modified
+        }
+        
+        // Normal function call
         if (!this.symbolTable.has(parsed.label)) {
             throw new Error(`Label '${parsed.label}' not found`);
         }
@@ -1897,6 +2214,498 @@ class ARM64Simulator {
         
         // BL does NOT increment PC - it's a branch instruction
         return true; // PC modified by branch
+    }
+
+    // Read ASCIZ string from memory
+    readString(address) {
+        let str = '';
+        let addr = address;
+        while (true) {
+            const byte = this.readMemory(addr, 1);
+            if (byte === 0n) break;
+            str += String.fromCharCode(Number(byte));
+            addr++;
+        }
+        return str;
+    }
+    
+    // Execute built-in I/O functions (async wrapper for input functions)
+    async executeBuiltInFunctionSync(funcName) {
+        switch (funcName) {
+            case 'printf':
+                this.builtinPrintf();
+                break;
+            case 'puts':
+                this.builtinPuts();
+                break;
+            case 'putchar':
+                this.builtinPutchar();
+                break;
+            case 'fgets':
+                await this.builtinFgetsSync();
+                break;
+            case 'gets':
+                await this.builtinGetsSync();
+                break;
+            case 'getchar':
+                await this.builtinGetcharSync();
+                break;
+            case 'scanf':
+                await this.builtinScanfSync();
+                break;
+            default:
+                throw new Error(`Unknown built-in function: ${funcName}`);
+        }
+    }
+    
+    builtinPrintf() {
+        // x0 = format string pointer
+        const fmtPtr = this.registers.x0;
+        if (fmtPtr === 0n) {
+            throw new Error('printf: null format string pointer');
+        }
+        
+        const fmt = this.readString(fmtPtr);
+        let output = '';
+        let argIndex = 1; // x1 is first argument after format string
+        
+        for (let i = 0; i < fmt.length; i++) {
+            if (fmt[i] === '%' && i + 1 < fmt.length) {
+                i++;
+                const spec = fmt[i];
+                let argReg = `x${argIndex}`;
+                
+                switch (spec) {
+                    case 'd':
+                    case 'i':
+                        // Signed decimal
+                        const signedVal = this.registers[argReg];
+                        const intVal = Number(signedVal > 0x7FFFFFFFFFFFFFFFn ? signedVal - 0x10000000000000000n : signedVal);
+                        output += intVal.toString();
+                        argIndex++;
+                        break;
+                    case 'u':
+                        // Unsigned decimal
+                        output += this.registers[argReg].toString();
+                        argIndex++;
+                        break;
+                    case 'x':
+                        // Hexadecimal (lowercase)
+                        output += this.registers[argReg].toString(16);
+                        argIndex++;
+                        break;
+                    case 'X':
+                        // Hexadecimal (uppercase)
+                        output += this.registers[argReg].toString(16).toUpperCase();
+                        argIndex++;
+                        break;
+                    case 'l':
+                        // Long modifier - check next char
+                        if (i + 1 < fmt.length) {
+                            i++;
+                            const nextSpec = fmt[i];
+                            if (nextSpec === 'd' || nextSpec === 'i') {
+                                // %ld or %li - signed long
+                                const signedVal = this.registers[argReg];
+                                const intVal = Number(signedVal > 0x7FFFFFFFFFFFFFFFn ? signedVal - 0x10000000000000000n : signedVal);
+                                output += intVal.toString();
+                                argIndex++;
+                            } else if (nextSpec === 'u') {
+                                // %lu - unsigned long
+                                output += this.registers[argReg].toString();
+                                argIndex++;
+                            } else if (nextSpec === 'x') {
+                                // %lx - hexadecimal long (lowercase)
+                                output += this.registers[argReg].toString(16);
+                                argIndex++;
+                            } else if (nextSpec === 'X') {
+                                // %lX - hexadecimal long (uppercase)
+                                output += this.registers[argReg].toString(16).toUpperCase();
+                                argIndex++;
+                            } else {
+                                // Invalid specifier after 'l'
+                                output += '%l' + nextSpec;
+                            }
+                        } else {
+                            // '%l' at end of string
+                            output += '%l';
+                        }
+                        break;
+                    case 's':
+                        // String
+                        const strPtr = this.registers[argReg];
+                        if (strPtr === 0n) {
+                            output += '(null)';
+                        } else {
+                            output += this.readString(strPtr);
+                        }
+                        argIndex++;
+                        break;
+                    case 'c':
+                        // Character
+                        const charCode = Number(this.registers[argReg] & 0xFFn);
+                        output += String.fromCharCode(charCode);
+                        argIndex++;
+                        break;
+                    case '%':
+                        // Literal %
+                        output += '%';
+                        break;
+                    default:
+                        output += '%' + spec;
+                }
+            } else if (fmt[i] === '\\' && i + 1 < fmt.length) {
+                i++;
+                switch (fmt[i]) {
+                    case 'n':
+                        output += '\n';
+                        break;
+                    case 't':
+                        output += '\t';
+                        break;
+                    case '\\':
+                        output += '\\';
+                        break;
+                    case '"':
+                        output += '"';
+                        break;
+                    default:
+                        output += '\\' + fmt[i];
+                }
+            } else {
+                output += fmt[i];
+            }
+        }
+        
+        if (this.ioCallbacks.output) {
+            this.ioCallbacks.output(output);
+        } else {
+            console.log(output);
+        }
+    }
+    
+    builtinPuts() {
+        // x0 = string pointer
+        const strPtr = this.registers.x0;
+        if (strPtr === 0n) {
+            if (this.ioCallbacks.output) {
+                this.ioCallbacks.output('\n');
+            }
+            return;
+        }
+        
+        const str = this.readString(strPtr);
+        const output = str + '\n';
+        
+        if (this.ioCallbacks.output) {
+            this.ioCallbacks.output(output);
+        } else {
+            console.log(output);
+        }
+    }
+    
+    builtinPutchar() {
+        // x0 = character code (32-bit)
+        const charCode = Number(this.registers.x0 & 0xFFn);
+        const char = String.fromCharCode(charCode);
+        
+        if (this.ioCallbacks.output) {
+            this.ioCallbacks.output(char);
+        } else {
+            console.log(char);
+        }
+    }
+    
+    async builtinFgetsSync() {
+        // x0 = buffer pointer
+        // x1 = size (max bytes to store)
+        // fgets reads up to size-1 characters, stops on newline OR after size-1 chars
+        // Newline IS included in buffer (unless size is too small)
+        // Always null-terminates
+        const bufPtr = this.registers.x0;
+        const size = Number(this.registers.x1);
+        
+        if (bufPtr === 0n || size <= 0) {
+            this.registers.x0 = 0n; // Return NULL on error
+            return;
+        }
+        
+        // Get input from user (async) - no prompt, reads silently
+        let input = '';
+        if (this.ioCallbacks.inputSync) {
+            input = await this.ioCallbacks.inputSync('');
+        } else {
+            input = prompt('') || '';
+        }
+        
+        // Find newline position
+        const newlineIndex = input.indexOf('\n');
+        const hasNewline = newlineIndex !== -1;
+        
+        // Determine how many characters to read
+        // Read up to size-1 characters, or until newline (whichever comes first)
+        let charsToRead;
+        if (hasNewline) {
+            // Include newline if it fits within size-1
+            charsToRead = Math.min(newlineIndex + 1, size - 1);
+        } else {
+            // No newline, read up to size-1 characters
+            charsToRead = Math.min(input.length, size - 1);
+        }
+        
+        // Write characters to buffer
+        for (let i = 0; i < charsToRead; i++) {
+            this.writeMemory(bufPtr + BigInt(i), BigInt(input.charCodeAt(i)), 1);
+        }
+        
+        // Always null-terminate (at position charsToRead, which is <= size-1)
+        this.writeMemory(bufPtr + BigInt(charsToRead), 0n, 1);
+        
+        // Return buffer pointer
+        this.registers.x0 = bufPtr;
+    }
+    
+    async builtinGetsSync() {
+        // x0 = buffer pointer
+        // gets reads entire line until newline, removes newline, adds null terminator
+        // No size limit (dangerous in real C), but stop at memory region end
+        const bufPtr = this.registers.x0;
+        
+        if (bufPtr === 0n) {
+            this.registers.x0 = 0n; // Return NULL on error
+            return;
+        }
+        
+        // Get input from user (async) - no prompt, reads silently
+        let input = '';
+        if (this.ioCallbacks.inputSync) {
+            input = await this.ioCallbacks.inputSync('');
+        } else {
+            input = prompt('') || '';
+        }
+        
+        // Find newline and stop there
+        const newlineIndex = input.indexOf('\n');
+        const lineEnd = newlineIndex !== -1 ? newlineIndex : input.length;
+        
+        // Write characters to buffer (excluding newline)
+        // Check memory bounds to prevent writing outside allocated regions
+        let i = 0;
+        for (let j = 0; j < lineEnd; j++) {
+            const addr = bufPtr + BigInt(i);
+            // Basic bounds check - don't write outside reasonable memory regions
+            if (addr > 0x07FFFFFFn) {
+                break; // Stop if we'd write outside stack region
+            }
+            this.writeMemory(addr, BigInt(input.charCodeAt(j)), 1);
+            i++;
+        }
+        
+        // Always null-terminate (newline is NOT included)
+        const nullAddr = bufPtr + BigInt(i);
+        if (nullAddr <= 0x07FFFFFFn) {
+            this.writeMemory(nullAddr, 0n, 1);
+        }
+        
+        // Return buffer pointer
+        this.registers.x0 = bufPtr;
+    }
+    
+    async builtinGetcharSync() {
+        // Get one character from user (synchronous)
+        let input = '';
+        if (this.ioCallbacks.inputSync) {
+            input = this.ioCallbacks.inputSync('Enter a character: ');
+        } else {
+            input = prompt('Enter a character: ') || '';
+        }
+        
+        const charCode = input.length > 0 ? input.charCodeAt(0) : 0;
+        this.registers.x0 = BigInt(charCode);
+    }
+    
+    async builtinScanfSync() {
+        // x0 = format string pointer
+        // x1, x2, ... = argument pointers
+        // Returns number of items successfully read in x0
+        const fmtPtr = this.registers.x0;
+        if (fmtPtr === 0n) {
+            throw new Error('scanf: null format string pointer');
+        }
+        
+        const fmt = this.readString(fmtPtr);
+        let argIndex = 1;
+        let itemsRead = 0;
+        
+        // Get input from user (async) - no prompt, reads silently
+        let input = '';
+        if (this.ioCallbacks.inputSync) {
+            input = await this.ioCallbacks.inputSync('');
+        } else {
+            input = prompt('') || '';
+        }
+        
+        // Track position in input string
+        let inputPos = 0;
+        
+        // Parse format string and read values
+        for (let i = 0; i < fmt.length; i++) {
+            if (fmt[i] === '%' && i + 1 < fmt.length) {
+                i++;
+                const spec = fmt[i];
+                
+                const argReg = `x${argIndex}`;
+                const argPtr = this.registers[argReg];
+                
+                if (argPtr === 0n) {
+                    argIndex++;
+                    continue;
+                }
+                
+                // For %c, don't skip whitespace. For others, skip leading whitespace
+                let shouldSkipWhitespace = true;
+                if (spec === 'c') {
+                    shouldSkipWhitespace = false;
+                }
+                
+                if (shouldSkipWhitespace) {
+                    // Skip whitespace before reading (scanf skips leading whitespace for most formats)
+                    while (inputPos < input.length && /\s/.test(input[inputPos])) {
+                        inputPos++;
+                    }
+                }
+                
+                if (inputPos >= input.length) {
+                    break; // End of input
+                }
+                
+                switch (spec) {
+                    case 'd':
+                    case 'i':
+                        // Signed integer - read until whitespace or end
+                        let intStr = '';
+                        while (inputPos < input.length && !/\s/.test(input[inputPos])) {
+                            intStr += input[inputPos];
+                            inputPos++;
+                        }
+                        const intVal = parseInt(intStr, 10);
+                        if (!isNaN(intVal)) {
+                            this.writeMemory(argPtr, BigInt(intVal), 8);
+                            itemsRead++;
+                        }
+                        break;
+                    case 'u':
+                        // Unsigned integer
+                        let uintStr = '';
+                        while (inputPos < input.length && !/\s/.test(input[inputPos])) {
+                            uintStr += input[inputPos];
+                            inputPos++;
+                        }
+                        const uintVal = parseInt(uintStr, 10);
+                        if (!isNaN(uintVal) && uintVal >= 0) {
+                            this.writeMemory(argPtr, BigInt(uintVal), 8);
+                            itemsRead++;
+                        }
+                        break;
+                    case 'x':
+                        // Hexadecimal
+                        let hexStr = '';
+                        while (inputPos < input.length && !/\s/.test(input[inputPos])) {
+                            hexStr += input[inputPos];
+                            inputPos++;
+                        }
+                        const hexVal = parseInt(hexStr, 16);
+                        if (!isNaN(hexVal)) {
+                            this.writeMemory(argPtr, BigInt(hexVal), 8);
+                            itemsRead++;
+                        }
+                        break;
+                    case 's':
+                        // String - read until whitespace (NOT entire line)
+                        let strStart = inputPos;
+                        while (inputPos < input.length && !/\s/.test(input[inputPos])) {
+                            inputPos++;
+                        }
+                        const strLen = inputPos - strStart;
+                        if (strLen > 0) {
+                            for (let j = 0; j < strLen; j++) {
+                                this.writeMemory(argPtr + BigInt(j), BigInt(input.charCodeAt(strStart + j)), 1);
+                            }
+                            this.writeMemory(argPtr + BigInt(strLen), 0n, 1);
+                            itemsRead++;
+                        }
+                        break;
+                    case 'c':
+                        // Character - reads single byte including whitespace (doesn't skip whitespace)
+                        // We already handled not skipping whitespace above
+                        if (inputPos < input.length) {
+                            this.writeMemory(argPtr, BigInt(input.charCodeAt(inputPos)), 1);
+                            inputPos++;
+                            itemsRead++;
+                        }
+                        break;
+                    case 'l':
+                        // Long modifier - %ld, %lu, %lx
+                        if (i + 1 < fmt.length) {
+                            i++;
+                            const nextSpec = fmt[i];
+                            // Skip whitespace before reading
+                            while (inputPos < input.length && /\s/.test(input[inputPos])) {
+                                inputPos++;
+                            }
+                            if (inputPos >= input.length) break;
+                            
+                            if (nextSpec === 'd' || nextSpec === 'i') {
+                                // %ld or %li - signed long
+                                let intStr = '';
+                                while (inputPos < input.length && !/\s/.test(input[inputPos])) {
+                                    intStr += input[inputPos];
+                                    inputPos++;
+                                }
+                                const intVal = parseInt(intStr, 10);
+                                if (!isNaN(intVal)) {
+                                    this.writeMemory(argPtr, BigInt(intVal), 8);
+                                    itemsRead++;
+                                }
+                            } else if (nextSpec === 'u') {
+                                // %lu - unsigned long
+                                let uintStr = '';
+                                while (inputPos < input.length && !/\s/.test(input[inputPos])) {
+                                    uintStr += input[inputPos];
+                                    inputPos++;
+                                }
+                                const uintVal = parseInt(uintStr, 10);
+                                if (!isNaN(uintVal) && uintVal >= 0) {
+                                    this.writeMemory(argPtr, BigInt(uintVal), 8);
+                                    itemsRead++;
+                                }
+                            } else if (nextSpec === 'x') {
+                                // %lx - hexadecimal long
+                                let hexStr = '';
+                                while (inputPos < input.length && !/\s/.test(input[inputPos])) {
+                                    hexStr += input[inputPos];
+                                    inputPos++;
+                                }
+                                const hexVal = parseInt(hexStr, 16);
+                                if (!isNaN(hexVal)) {
+                                    this.writeMemory(argPtr, BigInt(hexVal), 8);
+                                    itemsRead++;
+                                }
+                            }
+                        }
+                        break;
+                    default:
+                        // Unknown format specifier - skip it
+                        break;
+                }
+                argIndex++;
+            } else {
+                // Regular character in format string - skip it
+            }
+        }
+        
+        // Return number of items successfully read in x0
+        this.registers.x0 = BigInt(itemsRead);
     }
 
     executeRet(parsed) {

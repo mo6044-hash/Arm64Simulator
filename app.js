@@ -20,6 +20,75 @@ class SimulatorUI {
         this.currentInstruction = document.getElementById('currentInstruction');
         this.registersDisplay = document.getElementById('registersDisplay');
         this.memoryVisualization = document.getElementById('memoryVisualization');
+        this.consoleOutput = document.getElementById('consoleOutput');
+        this.clearConsoleBtn = document.getElementById('clearConsoleBtn');
+        this.consoleInputContainer = document.getElementById('consoleInputContainer');
+        this.consoleInput = document.getElementById('consoleInput');
+        this.consoleInputBtn = document.getElementById('consoleInputBtn');
+        
+        // Promise resolver for input
+        this.inputResolver = null;
+        
+        // Set up I/O callbacks for built-in functions
+        this.simulator.setIOCallbacks({
+            output: (text) => this.writeToConsole(text),
+            inputSync: (prompt) => this.getInputSync(prompt)
+        });
+    }
+    
+    writeToConsole(text) {
+        if (!this.consoleOutput) return;
+        this.consoleOutput.textContent += text;
+        this.consoleOutput.scrollTop = this.consoleOutput.scrollHeight;
+    }
+    
+    getInputSync(promptText) {
+        // Show input container with prompt
+        if (promptText) {
+            this.writeToConsole(promptText);
+        }
+        
+        // Show input container
+        if (this.consoleInputContainer) {
+            this.consoleInputContainer.style.display = 'flex';
+        }
+        
+        // Focus input field
+        if (this.consoleInput) {
+            this.consoleInput.focus();
+            this.consoleInput.value = '';
+        }
+        
+        // Return a promise that resolves when user submits
+        // The simulator will await this promise
+        return new Promise((resolve) => {
+            this.inputResolver = resolve;
+            
+            // Handle submit button click
+            const submitInput = () => {
+                const value = this.consoleInput ? this.consoleInput.value : '';
+                if (this.consoleInputContainer) {
+                    this.consoleInputContainer.style.display = 'none';
+                }
+                if (this.inputResolver) {
+                    this.inputResolver(value);
+                    this.inputResolver = null;
+                }
+            };
+            
+            // Set up event listeners (remove old ones first)
+            if (this.consoleInputBtn) {
+                this.consoleInputBtn.onclick = submitInput;
+            }
+            if (this.consoleInput) {
+                this.consoleInput.onkeydown = (e) => {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        submitInput();
+                    }
+                };
+            }
+        });
     }
 
     attachEventListeners() {
@@ -28,6 +97,15 @@ class SimulatorUI {
         this.runBtn.addEventListener('click', () => this.startRunning());
         this.pauseBtn.addEventListener('click', () => this.pause());
         this.resetBtn.addEventListener('click', () => this.reset());
+        if (this.clearConsoleBtn) {
+            this.clearConsoleBtn.addEventListener('click', () => this.clearConsole());
+        }
+    }
+    
+    clearConsole() {
+        if (this.consoleOutput) {
+            this.consoleOutput.textContent = '';
+        }
     }
 
     loadProgram() {
@@ -55,7 +133,7 @@ class SimulatorUI {
         }
     }
 
-    step() {
+    async step() {
         if (this.simulator.instructions.length === 0) {
             this.updateStatus('No program loaded');
             return;
@@ -67,7 +145,7 @@ class SimulatorUI {
         }
 
         try {
-            const success = this.simulator.step();
+            const success = await this.simulator.step();
             if (success) {
                 this.updateDisplay();
                 this.highlightCurrentInstruction();
@@ -98,33 +176,40 @@ class SimulatorUI {
         this.pauseBtn.disabled = false;
         this.stepBtn.disabled = true;
 
-        this.runInterval = setInterval(() => {
+        // Use async function for run loop (can't use setInterval with await)
+        const runLoop = async () => {
             if (this.simulator.isPaused) {
                 return;
             }
 
             try {
-                const success = this.simulator.step();
+                const success = await this.simulator.step();
                 this.updateDisplay();
                 this.highlightCurrentInstruction();
 
                 if (!success || this.simulator.currentInstructionIndex >= this.simulator.instructions.length) {
                     this.pause();
                     this.updateStatus('Program finished');
+                } else {
+                    // Schedule next step
+                    this.runInterval = setTimeout(runLoop, 500);
                 }
             } catch (error) {
                 this.pause();
                 this.updateStatus(`Error: ${error.message}`);
                 alert(`Execution error: ${error.message}`);
             }
-        }, 500); // 500ms delay between steps
+        };
+        
+        // Start the run loop
+        runLoop();
     }
 
     pause() {
         this.simulator.isRunning = false;
         this.simulator.isPaused = true;
         if (this.runInterval) {
-            clearInterval(this.runInterval);
+            clearTimeout(this.runInterval);
             this.runInterval = null;
         }
         this.runBtn.disabled = false;
@@ -135,7 +220,7 @@ class SimulatorUI {
 
     reset() {
         if (this.runInterval) {
-            clearInterval(this.runInterval);
+            clearTimeout(this.runInterval);
             this.runInterval = null;
         }
 
@@ -158,7 +243,8 @@ class SimulatorUI {
         // Update current instruction display
         if (currentIndex < this.simulator.instructions.length) {
             const instruction = this.simulator.instructions[currentIndex];
-            this.currentInstruction.textContent = `PC: ${currentIndex} | ${instruction.original}`;
+            const pcAddr = this.simulator.registers.pc;
+            this.currentInstruction.textContent = `PC: 0x${pcAddr.toString(16).toUpperCase().padStart(8, '0')} (${currentIndex}) | ${instruction.original}`;
             
             // Scroll to current instruction in textarea
             const lines = this.assemblyInput.value.split('\n');
@@ -181,12 +267,18 @@ class SimulatorUI {
     updateRegisters() {
         this.registersDisplay.innerHTML = '';
 
+        // Helper function to convert BigInt to unsigned 64-bit hex string
+        const toHex64 = (value) => {
+            // Convert to unsigned 64-bit representation for display
+            const mask = 0xFFFFFFFFFFFFFFFFn;
+            const unsigned = value & mask;
+            return `0x${unsigned.toString(16).toUpperCase().padStart(16, '0')}`;
+        };
+
         // Show Xn/Wn in single card for each register (0-30)
         for (let i = 0; i <= 30; i++) {
             const xRegName = `x${i}`;
             const xValue = this.simulator.registers[xRegName] || 0n;
-            const wValue = xValue & 0xFFFFFFFFn;
-            const decimalValue = Number(xValue);
             
             const isChanged = this.simulator.changedRegisters.has(xRegName) || 
                             this.simulator.changedRegisters.has(`w${i}`);
@@ -200,10 +292,10 @@ class SimulatorUI {
             registerName.className = 'register-name';
             registerName.textContent = `X${i} / W${i}`;
             
-            // X value (64-bit hex)
+            // X value (64-bit hex only)
             const xRegisterValue = document.createElement('div');
             xRegisterValue.className = 'register-value';
-            xRegisterValue.textContent = `0x${xValue.toString(16).toUpperCase().padStart(16, '0')}`;
+            xRegisterValue.textContent = toHex64(xValue);
             
             registerItem.appendChild(registerName);
             registerItem.appendChild(xRegisterValue);
@@ -221,7 +313,6 @@ class SimulatorUI {
         const specialRegs = ['sp', 'lr', 'pc'];
         specialRegs.forEach(regName => {
             const value = this.simulator.registers[regName] || 0n;
-            const decimalValue = Number(value);
             const isChanged = this.simulator.changedRegisters.has(regName);
 
             const registerItem = document.createElement('div');
@@ -233,7 +324,7 @@ class SimulatorUI {
             
             const registerValue = document.createElement('div');
             registerValue.className = 'register-value';
-            registerValue.textContent = `0x${value.toString(16).toUpperCase().padStart(16, '0')}`;
+            registerValue.textContent = toHex64(value);
             
             registerItem.appendChild(registerName);
             registerItem.appendChild(registerValue);

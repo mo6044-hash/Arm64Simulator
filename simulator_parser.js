@@ -48,6 +48,7 @@ class ARM64Parser {
                 lineAfterLabel = labelMatch[2].trim();
                 
                 // Set label address to current counter
+                // The label points to where the next item (instruction or data) will be placed
                 const address = sectionCounters[currentSection];
                 
                 if (symbolTable.has(labelName)) {
@@ -62,6 +63,7 @@ class ARM64Parser {
                 });
                 
                 // If there's nothing after the label, continue to next line
+                // The counter will be advanced when we process the next line
                 if (!lineAfterLabel) {
                     continue;
                 }
@@ -73,7 +75,7 @@ class ARM64Parser {
                 sectionCounters.text += 4n;
             } else {
                 // Handle data directives (use lineAfterLabel if label was on same line)
-                const directiveMatch = lineAfterLabel.match(/^\.(quad|word|hword|byte|skip|align)\s*(.*)$/i);
+                const directiveMatch = lineAfterLabel.match(/^\.(quad|word|hword|byte|skip|align|asciz|string)\s*(.*)$/i);
                 if (directiveMatch) {
                     const directive = directiveMatch[1].toLowerCase();
                     const rest = directiveMatch[2].trim();
@@ -84,6 +86,25 @@ class ARM64Parser {
                         const alignBytes = BigInt(1) << BigInt(alignPower); // 2^alignPower
                         const mask = alignBytes - 1n;
                         sectionCounters[currentSection] = (sectionCounters[currentSection] + mask) & ~mask;
+                    } else if (directive === 'asciz' || directive === 'string') {
+                        // .asciz "string" - null-terminated string
+                        // Parse the string and process escape sequences to get accurate length
+                        const stringMatch = rest.match(/^"((?:[^"\\]|\\.)*)"|^'((?:[^'\\]|\\.)*)'/);
+                        if (stringMatch) {
+                            const rawStr = stringMatch[1] || stringMatch[2] || '';
+                            // Process escape sequences to get actual string length
+                            let processedLength = 0;
+                            for (let i = 0; i < rawStr.length; i++) {
+                                if (rawStr[i] === '\\' && i + 1 < rawStr.length) {
+                                    i++; // Skip escape character
+                                    processedLength++; // Each escape sequence becomes one character
+                                } else {
+                                    processedLength++;
+                                }
+                            }
+                            // Count bytes: processed string length + 1 for null terminator
+                            sectionCounters[currentSection] += BigInt(processedLength + 1);
+                        }
                     } else if (directive === 'quad') {
                         const values = rest.split(',').filter(v => v.trim());
                         sectionCounters[currentSection] += BigInt(values.length) * 8n;
@@ -154,13 +175,15 @@ class ARM64Parser {
                     }
                 }
             } else if (trimmed.match(/^[a-zA-Z_][a-zA-Z0-9_]*\s*:\s*$/)) {
-                // Label on its own line (already in symbol table, just skip)
+                // Label on its own line (already in symbol table)
+                // The label address should match the current counter (where next instruction will be placed)
+                // Don't advance counter yet - it will advance when we process the next instruction
                 continue;
             }
 
             // Directive
             if (lineAfterLabel.startsWith('.')) {
-                const directiveMatch = lineAfterLabel.match(/^\.(quad|word|hword|byte|skip|align|global)\s*(.*)$/i);
+                const directiveMatch = lineAfterLabel.match(/^\.(quad|word|hword|byte|skip|align|global|asciz|string)\s*(.*)$/i);
                 if (directiveMatch) {
                     const directive = directiveMatch[1].toLowerCase();
                     const rest = directiveMatch[2].trim();
@@ -177,6 +200,69 @@ class ARM64Parser {
                         const mask = alignBytes - 1n;
                         // Align to next boundary: (current + mask) & ~mask
                         sectionCounters[currentSection] = (sectionCounters[currentSection] + mask) & ~mask;
+                        continue;
+                    }
+                    
+                    // Handle .asciz and .string directives (null-terminated strings)
+                    if (directive === 'asciz' || directive === 'string') {
+                        // Parse string literal (handles both "..." and '...')
+                        const stringMatch = rest.match(/^"((?:[^"\\]|\\.)*)"|^'((?:[^'\\]|\\.)*)'/);
+                        if (stringMatch) {
+                            const rawStr = stringMatch[1] || stringMatch[2] || '';
+                            // Process escape sequences
+                            let processedStr = '';
+                            for (let i = 0; i < rawStr.length; i++) {
+                                if (rawStr[i] === '\\' && i + 1 < rawStr.length) {
+                                    i++;
+                                    switch (rawStr[i]) {
+                                        case 'n':
+                                            processedStr += '\n';
+                                            break;
+                                        case 't':
+                                            processedStr += '\t';
+                                            break;
+                                        case '\\':
+                                            processedStr += '\\';
+                                            break;
+                                        case '"':
+                                            processedStr += '"';
+                                            break;
+                                        case '\'':
+                                            processedStr += '\'';
+                                            break;
+                                        case '0':
+                                            processedStr += '\0';
+                                            break;
+                                        default:
+                                            processedStr += rawStr[i];
+                                    }
+                                } else {
+                                    processedStr += rawStr[i];
+                                }
+                            }
+                            
+                            // Store each byte of the string plus null terminator
+                            const startAddr = sectionCounters[currentSection];
+                            for (let i = 0; i < processedStr.length; i++) {
+                                dataInitializations.push({
+                                    address: sectionCounters[currentSection],
+                                    value: BigInt(processedStr.charCodeAt(i)),
+                                    size: 1,
+                                    section: currentSection
+                                });
+                                sectionCounters[currentSection] += 1n;
+                            }
+                            // Add null terminator
+                            dataInitializations.push({
+                                address: sectionCounters[currentSection],
+                                value: 0n,
+                                size: 1,
+                                section: currentSection
+                            });
+                            sectionCounters[currentSection] += 1n;
+                        } else {
+                            throw new Error(`Invalid string literal in .asciz/.string directive: ${rest}`);
+                        }
                         continue;
                     }
                     
