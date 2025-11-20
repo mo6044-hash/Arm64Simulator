@@ -298,10 +298,13 @@ class ARM64Simulator {
                 break;
 
             case 'add':
+            case 'adds':
             case 'sub':
             case 'subs':
                 // add sp, sp, #16
                 // sub sp, sp, #16
+                // adds x0, x1, x2
+                // subs x0, x1, #5
                 // Also support: sub sp, sp, 16 (without #)
                 if (parts.length >= 4) {
                     // Remove commas from register names
@@ -327,21 +330,23 @@ class ARM64Simulator {
                 break;
 
             case 'cmp':
+            case 'cmn':
                 // cmp x0, x1 or cmp x0, #5
+                // cmn x0, x1 or cmn x0, #5 (compare negative - adds without destination)
                 if (parts.length >= 3) {
                     const src1Str = parts[1].replace(/,/g, '').trim();
                     result.src1 = this.parseRegister(src1Str);
                     
                     const src2 = parts.slice(2).join(' ').replace(/,/g, '').trim();
                     if (src2.startsWith('#')) {
-                        // Immediate: cmp xN, #imm
+                        // Immediate: cmp xN, #imm or cmn xN, #imm
                         result.immediate = BigInt(src2.substring(1));
                     } else {
-                        // Register: cmp xN, xM
+                        // Register: cmp xN, xM or cmn xN, xM
                         result.src2 = this.parseRegister(src2);
                     }
                 } else {
-                    throw new Error(`Invalid cmp instruction: missing operands`);
+                    throw new Error(`Invalid ${opcode} instruction: missing operands`);
                 }
                 break;
 
@@ -374,6 +379,53 @@ class ARM64Simulator {
                     } else {
                         // Register: and x0, x1, x2
                         result.src2 = this.parseRegister(src2Part);
+                    }
+                }
+                break;
+
+            case 'lsl':
+            case 'lsr':
+            case 'asr':
+            case 'ror':
+            case 'mvn':
+                // Shift and bitwise NOT instructions
+                // lsl x0, x1, #4
+                // lsl x0, x1, x2
+                // mvn x0, x1
+                if (parts.length >= 3) {
+                    const destStr = parts[1].replace(/,/g, '').trim();
+                    const src1Str = parts[2].replace(/,/g, '').trim();
+                    result.dest = this.parseRegister(destStr);
+                    result.src1 = this.parseRegister(src1Str);
+                    
+                    // For mvn, there's no second operand
+                    if (opcode === 'mvn') {
+                        // mvn x0, x1 (bitwise NOT)
+                        break;
+                    }
+                    
+                    // For shifts, get shift amount (immediate or register)
+                    if (parts.length >= 4) {
+                        const shiftPart = parts.slice(3).join(' ').replace(/,/g, '').trim();
+                        if (shiftPart.startsWith('#')) {
+                            // Immediate: lsl x0, x1, #4 or lsl x0, x1, #0xFF
+                            const immStr = shiftPart.substring(1);
+                            // Handle hex (0x) and decimal
+                            if (immStr.toLowerCase().startsWith('0x')) {
+                                result.immediate = BigInt(immStr);
+                            } else {
+                                result.immediate = BigInt(immStr);
+                            }
+                        } else {
+                            // Try to parse as number (immediate without #)
+                            const numValue = parseInt(shiftPart);
+                            if (!isNaN(numValue)) {
+                                result.immediate = BigInt(numValue);
+                            } else {
+                                // Register: lsl x0, x1, x2
+                                result.src2 = this.parseRegister(shiftPart);
+                            }
+                        }
                     }
                 }
                 break;
@@ -579,9 +631,14 @@ class ARM64Simulator {
                 case 'add':
                     this.executeAdd(parsed);
                     break;
+                case 'adds':
+                    this.executeArithmeticWithFlags(parsed, 'add', true);
+                    break;
                 case 'sub':
+                    this.executeSub(parsed, false);
+                    break;
                 case 'subs':
-                    this.executeSub(parsed, opcode === 'subs');
+                    this.executeArithmeticWithFlags(parsed, 'sub', true);
                     break;
                 case 'str':
                     this.executeStr(parsed);
@@ -596,7 +653,10 @@ class ARM64Simulator {
                     this.executeAdrp(parsed, instructionAddress);
                     break;
                 case 'cmp':
-                    this.executeCmp(parsed);
+                    this.executeArithmeticWithFlags(parsed, 'sub', false);
+                    break;
+                case 'cmn':
+                    this.executeArithmeticWithFlags(parsed, 'add', false);
                     break;
                 case 'and':
                 case 'ands':
@@ -604,6 +664,13 @@ class ARM64Simulator {
                 case 'eor':
                 case 'bic':
                     this.executeLogical(parsed, opcode);
+                    break;
+                case 'lsl':
+                case 'lsr':
+                case 'asr':
+                case 'ror':
+                case 'mvn':
+                    this.executeShift(parsed, opcode);
                     break;
                 case 'b':
                     pcModified = this.executeB(parsed);
@@ -902,6 +969,99 @@ class ARM64Simulator {
             this.flags.Z = (result & mask) === 0n; // Zero flag
             // C and V flags are unaffected by logical operations
         }
+    }
+
+    executeShift(parsed, opcode) {
+        // Shift instructions: LSL, LSR, ASR, ROR, and MVN (bitwise NOT)
+        // lsl x0, x1, #4
+        // lsl x0, x1, x2
+        // lsr x0, x1, #2
+        // asr x0, x1, #1
+        // ror x0, x1, #1
+        // mvn x0, x1
+        if (!parsed.dest || !parsed.src1) {
+            throw new Error(`Invalid ${opcode} instruction: missing destination or source register`);
+        }
+        
+        const val1 = this.getRegisterValue(parsed.src1);
+        let result;
+        
+        // Determine result size based on destination register
+        const size = (parsed.dest && parsed.dest.type === 'w') ? 32 : 64;
+        const mask = size === 64 ? 0xFFFFFFFFFFFFFFFFn : 0xFFFFFFFFn;
+        
+        if (opcode === 'mvn') {
+            // MVN: bitwise NOT
+            result = (~val1) & mask;
+        } else {
+            // Get shift amount
+            let shiftAmount = 0n;
+            if (parsed.immediate !== undefined) {
+                shiftAmount = parsed.immediate;
+            } else if (parsed.src2) {
+                // For register-based shifts, mask to valid shift amount bits
+                // 64-bit: lower 6 bits (0-63)
+                // 32-bit: lower 5 bits (0-31)
+                const shiftMask = size === 64 ? 0x3Fn : 0x1Fn;
+                shiftAmount = this.getRegisterValue(parsed.src2) & BigInt(shiftMask);
+            } else {
+                throw new Error(`Invalid ${opcode} instruction: missing shift amount`);
+            }
+            
+            // Zero shift is a no-op
+            if (shiftAmount === 0n) {
+                result = val1 & mask;
+            } else {
+                // Apply the shift operation
+                switch (opcode) {
+                    case 'lsl':
+                        // Logical shift left
+                        result = (val1 << shiftAmount) & mask;
+                        break;
+                    case 'lsr':
+                        // Logical shift right
+                        result = (val1 >> shiftAmount) & mask;
+                        break;
+                    case 'asr':
+                        // Arithmetic shift right (sign-extending)
+                        // Sign-extend the value first
+                        let signedVal = val1 & mask;
+                        const signBit = size === 64 ? 63 : 31;
+                        const signMask = 1n << BigInt(signBit);
+                        
+                        if ((signedVal & signMask) !== 0n) {
+                            // Negative: sign-extend upper bits
+                            signedVal = signedVal | (~mask);
+                        }
+                        
+                        // Perform arithmetic shift right
+                        result = signedVal >> shiftAmount;
+                        result = result & mask;
+                        break;
+                    case 'ror':
+                        // Rotate right: bits that fall off the right end wrap around to the left
+                        const rotateAmount = Number(shiftAmount) % size;
+                        if (rotateAmount === 0) {
+                            result = val1 & mask;
+                        } else {
+                            // Extract lower bits that will wrap around
+                            const lowerBits = val1 & ((1n << BigInt(rotateAmount)) - 1n);
+                            // Shift the value right
+                            const shifted = val1 >> BigInt(rotateAmount);
+                            // Move lower bits to the top
+                            result = (shifted | (lowerBits << BigInt(size - rotateAmount))) & mask;
+                        }
+                        break;
+                    default:
+                        throw new Error(`Unknown shift operation: ${opcode}`);
+                }
+            }
+        }
+        
+        // Write result to destination register
+        this.setRegisterValue(parsed.dest, result);
+        
+        // Shift instructions do NOT modify flags
     }
 
     executeStr(parsed) {
@@ -1451,6 +1611,129 @@ class ARM64Simulator {
         this.flags.N = (result & (1n << BigInt(signBit))) !== 0n;
         this.flags.Z = (result & mask) === 0n;
         // C and V flags need more context (carry/overflow from operation)
+    }
+
+    executeArithmeticWithFlags(parsed, operation, writeResult) {
+        // Handles: adds, subs, cmp, cmn
+        // operation: 'add' or 'sub'
+        // writeResult: true for adds/subs (write to dest), false for cmp/cmn (flags only)
+        
+        if (!parsed.src1) {
+            throw new Error(`Invalid ${operation} instruction: missing first operand`);
+        }
+        
+        const val1 = this.getRegisterValue(parsed.src1);
+        let val2;
+        
+        // Get second operand
+        if (parsed.immediate !== undefined) {
+            val2 = parsed.immediate;
+        } else if (parsed.src2) {
+            val2 = this.getRegisterValue(parsed.src2);
+        } else {
+            throw new Error(`Invalid ${operation} instruction: missing second operand`);
+        }
+        
+        // Determine register size
+        const size = (parsed.src1 && parsed.src1.type === 'w') ? 32 : 64;
+        const mask = size === 64 ? 0xFFFFFFFFFFFFFFFFn : 0xFFFFFFFFn;
+        const signBit = size === 64 ? 63 : 31;
+        const signMask = 1n << BigInt(signBit);
+        
+        // Mask operands to size
+        const maskedVal1 = val1 & mask;
+        const maskedVal2 = val2 & mask;
+        
+        // Perform the operation
+        let result;
+        if (operation === 'add') {
+            result = (maskedVal1 + maskedVal2) & mask;
+        } else { // 'sub'
+            result = (maskedVal1 - maskedVal2) & mask;
+        }
+        
+        // Handle stack operations if destination is sp
+        if (writeResult && parsed.dest) {
+            const destReg = parsed.dest;
+            const isStackOp = (typeof destReg === 'string' && destReg === 'sp');
+            
+            if (isStackOp) {
+                // Stack pointer is always 64-bit, use full values
+                // Validate stack alignment
+                if (operation === 'add') {
+                    if (val2 % 16n !== 0n) {
+                        throw new Error(`Stack operations (add sp) must use values that are multiples of 16 for alignment. Got: ${val2}`);
+                    }
+                    const newSP = val1 + val2; // Use full 64-bit values for SP
+                    if (newSP % 16n !== 0n) {
+                        throw new Error(`Stack pointer must remain 16-byte aligned. New SP would be: 0x${newSP.toString(16)}`);
+                    }
+                    this.setRegisterValue(parsed.dest, newSP);
+                    this.destroyStackFrame(Number(newSP), Number(val2));
+                    // Update result for flag calculation (use masked result)
+                    result = newSP & mask;
+                } else { // 'sub'
+                    if (val2 % 16n !== 0n) {
+                        throw new Error(`Stack operations (sub sp) must use values that are multiples of 16 for alignment. Got: ${val2}`);
+                    }
+                    const newSP = val1 - val2; // Use full 64-bit values for SP
+                    if (newSP % 16n !== 0n) {
+                        throw new Error(`Stack pointer must remain 16-byte aligned. New SP would be: 0x${newSP.toString(16)}`);
+                    }
+                    if (newSP < 0n) {
+                        throw new Error(`Stack overflow: SP would become negative`);
+                    }
+                    this.setRegisterValue(parsed.dest, newSP);
+                    this.createStackFrame(Number(newSP), Number(val2));
+                    // Update result for flag calculation (use masked result)
+                    result = newSP & mask;
+                }
+            } else {
+                // Normal register operation - write result
+                this.setRegisterValue(parsed.dest, result);
+            }
+        }
+        
+        // Calculate all four flags
+        // N (Negative): MSB of result
+        this.flags.N = (result & signMask) !== 0n;
+        
+        // Z (Zero): result is zero
+        this.flags.Z = (result & mask) === 0n;
+        
+        // C (Carry/Borrow): depends on operation
+        if (operation === 'add') {
+            // For ADD/ADDS/CMN: C=1 on unsigned overflow (result < val1)
+            // This means the addition wrapped around
+            this.flags.C = result < maskedVal1;
+        } else { // 'sub'
+            // For SUB/SUBS/CMP: C=1 when no borrow (val1 >= val2 in unsigned sense)
+            // C=0 when borrow occurs (val1 < val2)
+            this.flags.C = maskedVal1 >= maskedVal2;
+        }
+        
+        // V (Overflow): signed overflow in two's complement
+        if (operation === 'add') {
+            // Overflow in addition occurs when:
+            // - Both operands have the same sign (both positive or both negative)
+            // - AND the result has a different sign
+            const val1Negative = (maskedVal1 & signMask) !== 0n;
+            const val2Negative = (maskedVal2 & signMask) !== 0n;
+            const resultNegative = (result & signMask) !== 0n;
+            
+            // Overflow: (both positive && result negative) OR (both negative && result positive)
+            this.flags.V = (val1Negative === val2Negative) && (resultNegative !== val1Negative);
+        } else { // 'sub'
+            // Overflow in subtraction occurs when:
+            // - Operands have different signs (val1 negative != val2 negative)
+            // - AND the result has a different sign than val1
+            const val1Negative = (maskedVal1 & signMask) !== 0n;
+            const val2Negative = (maskedVal2 & signMask) !== 0n;
+            const resultNegative = (result & signMask) !== 0n;
+            
+            // Overflow: (different signs) && (result sign != val1 sign)
+            this.flags.V = (val1Negative !== val2Negative) && (resultNegative !== val1Negative);
+        }
     }
 
     // CMP instruction: compare two values and set flags
