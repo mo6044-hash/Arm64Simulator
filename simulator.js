@@ -81,6 +81,11 @@ class ARM64Simulator {
         // Track stack frames for visualization
         this.stackFrames = []; // Array of {sp: address, size: bytes, id: number, top: address}
         this.nextFrameId = 1;
+        
+        // Track entry point (_start/main) to detect when RET should end program
+        this.entryPointAddress = 0n;
+        this.entryPointLabel = null; // Store the label name (_start or main)
+        this.entryFunctionEndIndex = -1; // Last instruction index of entry function
     }
 
     loadProgram(assemblyCode) {
@@ -176,6 +181,34 @@ class ARM64Simulator {
         // PC must point to the instruction that will be executed when step() is first called
         // This is the instruction at currentInstructionIndex
         this.registers.pc = entryPoint;
+        
+        // Store entry point address and label to detect when RET is called from _start/main
+        this.entryPointAddress = entryPoint;
+        this.entryPointLabel = entryLabel;
+        
+        // Find the end of the entry function by looking for the next function label
+        // A function label is one that's in the .text section and has an address after the entry point
+        let entryFunctionEndIndex = instructions.length; // Default: end of program
+        if (entryLabel) {
+            const entryPointIndex = this.findInstructionIndexByAddress(entryPoint);
+            
+            // Look for the next function label (text section label) after the entry point
+            for (const [labelName, labelInfo] of symbolTable.entries()) {
+                // Skip the entry label itself
+                if (labelName === entryLabel) continue;
+                
+                // Check if this is a function label (in text section)
+                if (labelInfo.section === 'text' && labelInfo.address > entryPoint) {
+                    // Found the next function - find its instruction index
+                    const nextFunctionIndex = this.findInstructionIndexByAddress(labelInfo.address);
+                    if (nextFunctionIndex > entryPointIndex) {
+                        entryFunctionEndIndex = nextFunctionIndex;
+                        break; // Use the first function we find after entry point
+                    }
+                }
+            }
+        }
+        this.entryFunctionEndIndex = entryFunctionEndIndex;
         
         // Force UI update to show initialized memory
         if (window.simulatorUI) {
@@ -309,6 +342,39 @@ class ARM64Simulator {
                     }
                 } else {
                     throw new Error(`Invalid cmp instruction: missing operands`);
+                }
+                break;
+
+            case 'and':
+            case 'ands':
+            case 'orr':
+            case 'eor':
+            case 'bic':
+                // Logical operations: and x0, x1, x2
+                // and x0, x1, #0xFF
+                // and x0, x1, x2, lsl #3
+                if (parts.length >= 4) {
+                    const destStr = parts[1].replace(/,/g, '').trim();
+                    const src1Str = parts[2].replace(/,/g, '').trim();
+                    result.dest = this.parseRegister(destStr);
+                    result.src1 = this.parseRegister(src1Str);
+                    
+                    // Get the second operand (immediate, register, or shifted register)
+                    const src2Part = parts.slice(3).join(' ').replace(/,/g, '').trim();
+                    
+                    // Check for shifted register: "x2, lsl #3" or "x2, lsr #2" or "x2, asr #1"
+                    const shiftedMatch = src2Part.match(/^(\w+)\s*,\s*(lsl|lsr|asr)\s*#(\d+)$/i);
+                    if (shiftedMatch) {
+                        result.src2 = this.parseRegister(shiftedMatch[1]);
+                        result.shiftType = shiftedMatch[2].toLowerCase();
+                        result.shiftAmount = parseInt(shiftedMatch[3]);
+                    } else if (src2Part.startsWith('#')) {
+                        // Immediate: and x0, x1, #0xFF
+                        result.immediate = BigInt(src2Part.substring(1));
+                    } else {
+                        // Register: and x0, x1, x2
+                        result.src2 = this.parseRegister(src2Part);
+                    }
                 }
                 break;
 
@@ -532,6 +598,13 @@ class ARM64Simulator {
                 case 'cmp':
                     this.executeCmp(parsed);
                     break;
+                case 'and':
+                case 'ands':
+                case 'orr':
+                case 'eor':
+                case 'bic':
+                    this.executeLogical(parsed, opcode);
+                    break;
                 case 'b':
                     pcModified = this.executeB(parsed);
                     break;
@@ -540,7 +613,10 @@ class ARM64Simulator {
                     break;
                 case 'ret':
                     pcModified = this.executeRet(parsed);
-                    if (!pcModified) return false; // End of program
+                    if (!pcModified) {
+                        // Program ended (returning from _start/main)
+                        return false; // End of program
+                    }
                     break;
                 case 'cbz':
                 case 'cbnz':
@@ -731,6 +807,100 @@ class ARM64Simulator {
                 const size = (parsed.dest && parsed.dest.type === 'w') ? 32 : 64;
                 this.updateFlags(result, size);
             }
+        }
+    }
+
+    executeLogical(parsed, opcode) {
+        // Logical operations: AND, ANDS, ORR, EOR, BIC
+        // and x0, x1, x2
+        // and x0, x1, #0xFF
+        // and x0, x1, x2, lsl #3
+        if (!parsed.dest || !parsed.src1) {
+            throw new Error(`Invalid ${opcode} instruction: missing destination or source register`);
+        }
+        
+        const val1 = this.getRegisterValue(parsed.src1);
+        let val2;
+        
+        // Get second operand (immediate, register, or shifted register)
+        if (parsed.immediate !== undefined) {
+            val2 = parsed.immediate;
+        } else if (parsed.src2) {
+            val2 = this.getRegisterValue(parsed.src2);
+            
+            // Apply shift if specified
+            if (parsed.shiftType && parsed.shiftAmount !== undefined) {
+                const shiftAmount = BigInt(parsed.shiftAmount);
+                switch (parsed.shiftType) {
+                    case 'lsl':
+                        // Logical shift left
+                        val2 = val2 << shiftAmount;
+                        break;
+                    case 'lsr':
+                        // Logical shift right
+                        val2 = val2 >> shiftAmount;
+                        break;
+                    case 'asr':
+                        // Arithmetic shift right (sign-extending)
+                        // For BigInt, right shift is arithmetic (sign-extending) by default
+                        // But we need to ensure proper sign extension for the register size
+                        const srcSize = (parsed.src2 && parsed.src2.type === 'w') ? 32 : 64;
+                        const srcMask = srcSize === 64 ? 0xFFFFFFFFFFFFFFFFn : 0xFFFFFFFFn;
+                        const srcSignBit = srcSize === 64 ? 63 : 31;
+                        
+                        // Sign-extend the value to the proper size first
+                        let signedVal = val2 & srcMask;
+                        if ((signedVal & (1n << BigInt(srcSignBit))) !== 0n) {
+                            // Negative: sign-extend upper bits
+                            signedVal = signedVal | (~srcMask);
+                        }
+                        
+                        // Perform arithmetic shift right (BigInt >> is arithmetic for signed values)
+                        val2 = signedVal >> shiftAmount;
+                        
+                        // Mask to size
+                        val2 = val2 & srcMask;
+                        break;
+                }
+            }
+        } else {
+            throw new Error(`Invalid ${opcode} instruction: missing second operand`);
+        }
+        
+        // Determine result size based on destination register
+        const size = (parsed.dest && parsed.dest.type === 'w') ? 32 : 64;
+        const mask = size === 64 ? 0xFFFFFFFFFFFFFFFFn : 0xFFFFFFFFn;
+        
+        // Perform the logical operation
+        let result;
+        switch (opcode) {
+            case 'and':
+            case 'ands':
+                result = (val1 & val2) & mask;
+                break;
+            case 'orr':
+                result = (val1 | val2) & mask;
+                break;
+            case 'eor':
+                result = (val1 ^ val2) & mask;
+                break;
+            case 'bic':
+                // BIC: Rd = Rn & (~Rm)
+                result = (val1 & (~val2)) & mask;
+                break;
+            default:
+                throw new Error(`Unknown logical operation: ${opcode}`);
+        }
+        
+        // Write result to destination register
+        this.setRegisterValue(parsed.dest, result);
+        
+        // Update flags for ANDS only
+        if (opcode === 'ands') {
+            const signBit = size === 64 ? 63 : 31;
+            this.flags.N = (result & (1n << BigInt(signBit))) !== 0n; // Negative flag
+            this.flags.Z = (result & mask) === 0n; // Zero flag
+            // C and V flags are unaffected by logical operations
         }
     }
 
@@ -952,7 +1122,22 @@ class ARM64Simulator {
         // 1. Use instructionAddress for PC-relative operations (ADR, ADRP)
         // 2. Update PC after execution (either +4 for next instruction, or branch target)
         // 3. Update currentInstructionIndex based on the new PC
-        this.executeInstruction(instruction);
+        // 4. Return false if program should end (e.g., ret from _start/main)
+        const shouldContinue = this.executeInstruction(instruction);
+        if (!shouldContinue) {
+            // Program ended
+            return false;
+        }
+        
+        // Check if we've reached the end of instructions
+        if (this.currentInstructionIndex >= this.instructions.length) {
+            return false; // End of program
+        }
+        
+        // Check if PC is 0 (invalid/end state)
+        if (this.registers.pc === 0n) {
+            return false; // End of program
+        }
         
         // currentInstructionIndex is already updated by executeInstruction
         return true;
@@ -1417,37 +1602,88 @@ class ARM64Simulator {
             throw new Error(`Label '${parsed.label}' not found`);
         }
         
-        // Save return address (PC + 4) in x30 (LR is x30, not a separate register)
+        // BL must store the return address (PC + 4) in x30 (LR)
+        // PC currently points to the BL instruction being executed
         const returnAddress = this.registers.pc + 4n;
         this.setRegisterValue({ type: 'x', num: 30, name: 'x30' }, returnAddress);
         
-        // Jump to label
+        // Jump to label (BL is a branch, sets PC directly, no increment)
         const labelInfo = this.symbolTable.get(parsed.label);
         this.registers.pc = labelInfo.address;
         this.currentInstructionIndex = this.findInstructionIndexByAddress(this.registers.pc);
-        return true; // PC modified
+        
+        // BL does NOT increment PC - it's a branch instruction
+        return true; // PC modified by branch
     }
 
     executeRet(parsed) {
-        // ret returns to address in x30 (LR is x30, not a separate register)
-        // If ret Xn is specified, use that register instead
-        if (parsed.src) {
-            const retAddr = this.getRegisterValue(parsed.src);
-            this.registers.pc = retAddr;
-        } else {
-            // Default: use x30 (LR)
-            const retAddr = this.getRegisterValue({ type: 'x', num: 30, name: 'x30' });
-            this.registers.pc = retAddr;
+        // RET is a branch instruction - it sets PC directly, no increment
+        // RET uses X30 (LR) by default, or specified register
+        // RET does NOT modify stack, registers (except PC), or flags
+        
+        // Get the current instruction address (the RET being executed)
+        // Note: this.registers.pc is set to the current instruction address by step() before executeInstruction
+        const currentInstructionAddr = this.registers.pc;
+        
+        // Find the current instruction index
+        const currentInstructionIndex = this.findInstructionIndexByAddress(currentInstructionAddr);
+        
+        // CRITICAL: Check if this RET belongs to _start/main function
+        // _start/main is the top-level function - it has no caller, so RET must halt execution
+        // If we check x30 first, it might contain a return address from a previous BL call,
+        // which would cause an infinite loop (RET jumps back into _start)
+        
+        // We need to check if the current RET is within the _start/main function specifically,
+        // not just any function that comes after the entry point
+        if (this.entryPointLabel && this.entryPointAddress >= 0n) {
+            const entryPointIndex = this.findInstructionIndexByAddress(this.entryPointAddress);
+            
+            // Check if current instruction is within the entry function range
+            // (from entry point index to entry function end index)
+            // This ensures we only end on RET in _start/main, not in other functions
+            if (currentInstructionIndex >= entryPointIndex && 
+                currentInstructionIndex < this.entryFunctionEndIndex &&
+                currentInstructionAddr >= this.entryPointAddress) {
+                // We're executing RET in _start/main - ALWAYS end the program immediately
+                // Do NOT check x30 or return address - just halt immediately
+                // This prevents the infinite loop where RET in _start uses x30 from a previous BL call
+                this.registers.pc = 0n;
+                return false; // End of program
+            }
         }
         
-        this.currentInstructionIndex = this.findInstructionIndexByAddress(this.registers.pc);
+        // For normal functions (not _start/main), get return address
+        let retAddr;
+        if (parsed.src) {
+            retAddr = this.getRegisterValue(parsed.src);
+        } else {
+            // Default: use x30 (LR)
+            retAddr = this.getRegisterValue({ type: 'x', num: 30, name: 'x30' });
+        }
         
-        // Check if we've reached end of program
-        if (this.currentInstructionIndex >= this.instructions.length || this.registers.pc === 0n) {
+        // For normal functions (not _start/main), validate return address
+        // Check if return address is 0 or invalid
+        if (retAddr === 0n || retAddr < 0x00000000n) {
+            // Invalid return address
+            this.registers.pc = 0n;
             return false; // End of program
         }
         
-        return true; // PC modified
+        // Check if return address is within valid instruction range
+        const instructionIndex = this.findInstructionIndexByAddress(retAddr);
+        if (instructionIndex < 0 || instructionIndex >= this.instructions.length) {
+            // Return address is outside valid instruction range
+            this.registers.pc = 0n;
+            return false; // End of program
+        }
+        
+        // Valid return address - jump to it
+        // RET is a branch instruction: PC = retAddr (no increment)
+        this.registers.pc = retAddr;
+        this.currentInstructionIndex = instructionIndex;
+        
+        // RET does NOT increment PC - it's a branch instruction
+        return true; // PC modified by branch
     }
 
     getAllMemoryRegions() {
