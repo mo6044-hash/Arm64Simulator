@@ -112,6 +112,13 @@ header h1 {
     font-weight: 600;
 }
 
+.code-editor-wrapper {
+    position: relative;
+    flex: 1;
+    display: flex;
+    overflow: hidden;
+}
+
 .code-editor {
     flex: 1;
     padding: 20px;
@@ -123,6 +130,25 @@ header h1 {
     background: var(--bg-secondary);
     color: var(--text-primary);
     line-height: 1.8;
+    position: relative;
+    z-index: 1;
+}
+
+.instruction-ribbon {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 1.8em;
+    background: linear-gradient(90deg, 
+        rgba(99, 102, 241, 0.3) 0%, 
+        rgba(139, 92, 246, 0.4) 50%, 
+        rgba(99, 102, 241, 0.3) 100%);
+    border-left: 4px solid var(--accent-primary);
+    pointer-events: none;
+    z-index: 2;
+    transition: top 0.2s ease-in-out;
+    display: none;
+    box-shadow: 0 0 10px rgba(99, 102, 241, 0.3);
 }
 
 .code-editor::placeholder {

@@ -4,6 +4,7 @@ class SimulatorUI {
     constructor() {
         this.simulator = new ARM64Simulator();
         this.runInterval = null;
+        this.instructionLineMap = new Map(); // Maps instruction index to line number
         this.initializeElements();
         this.attachEventListeners();
         this.updateDisplay();
@@ -11,6 +12,7 @@ class SimulatorUI {
 
     initializeElements() {
         this.assemblyInput = document.getElementById('assemblyInput');
+        this.instructionRibbon = document.getElementById('instructionRibbon');
         this.loadBtn = document.getElementById('loadBtn');
         this.stepBtn = document.getElementById('stepBtn');
         this.runBtn = document.getElementById('runBtn');
@@ -100,11 +102,79 @@ class SimulatorUI {
         if (this.clearConsoleBtn) {
             this.clearConsoleBtn.addEventListener('click', () => this.clearConsole());
         }
+        
+        // Update ribbon position when textarea scrolls
+        if (this.assemblyInput) {
+            this.assemblyInput.addEventListener('scroll', () => {
+                this.highlightCurrentInstruction();
+            });
+        }
     }
     
     clearConsole() {
         if (this.consoleOutput) {
             this.consoleOutput.textContent = '';
+        }
+    }
+
+    buildInstructionLineMap(code) {
+        // Build a map from instruction index to line number in the textarea
+        // This matches exactly how the parser counts instructions
+        this.instructionLineMap = new Map();
+        const lines = code.split('\n');
+        let instructionIndex = 0;
+        let currentSection = 'text';
+        
+        // Helper to remove comments (matches parser's removeComments)
+        const removeComments = (line) => {
+            return line.split('//')[0].split(';')[0];
+        };
+        
+        for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+            const line = lines[lineNum];
+            const trimmed = removeComments(line).trim();
+            if (!trimmed) continue;
+            
+            // Section directive
+            const sectionMatch = trimmed.match(/^\.(text|rodata|data|bss)\s*$/i);
+            if (sectionMatch) {
+                currentSection = sectionMatch[1].toLowerCase();
+                continue;
+            }
+            
+            // Check for label on same line (e.g., "label: .quad 10")
+            let labelMatch = trimmed.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(.*)$/);
+            let lineAfterLabel = trimmed;
+            
+            if (labelMatch) {
+                lineAfterLabel = labelMatch[2].trim();
+            } else if (trimmed.match(/^[a-zA-Z_][a-zA-Z0-9_]*\s*:\s*$/)) {
+                // Label on its own line - skip it
+                continue;
+            }
+            
+            // Directive
+            if (lineAfterLabel.startsWith('.')) {
+                const directiveMatch = lineAfterLabel.match(/^\.(quad|word|hword|byte|skip|align|global|asciz|string)\s*(.*)$/i);
+                if (directiveMatch) {
+                    const directive = directiveMatch[1].toLowerCase();
+                    if (directive === 'global' || directive === 'align') {
+                        continue;
+                    }
+                    // Other directives are not instructions
+                    continue;
+                }
+            }
+            
+            // Instruction (only in .text section)
+            if (currentSection === 'text') {
+                // Try to parse as instruction - use the same logic as parser
+                const parsed = this.simulator.parseInstruction(trimmed);
+                if (parsed) {
+                    this.instructionLineMap.set(instructionIndex, lineNum);
+                    instructionIndex++;
+                }
+            }
         }
     }
 
@@ -116,6 +186,9 @@ class SimulatorUI {
         }
 
         try {
+            // Build instruction line map before loading
+            this.buildInstructionLineMap(code);
+            
             this.simulator.loadProgram(code);
             this.updateDisplay();
             this.updateStatus('Program loaded');
@@ -246,16 +319,50 @@ class SimulatorUI {
             const pcAddr = this.simulator.registers.pc;
             this.currentInstruction.textContent = `PC: 0x${pcAddr.toString(16).toUpperCase().padStart(8, '0')} (${currentIndex}) | ${instruction.original}`;
             
-            // Scroll to current instruction in textarea
-            const lines = this.assemblyInput.value.split('\n');
-            let charIndex = 0;
-            for (let i = 0; i < currentIndex && i < lines.length; i++) {
-                charIndex += lines[i].length + 1; // +1 for newline
+            // Use the instruction line map to find the correct line
+            let instructionLineIndex = -1;
+            if (this.instructionLineMap && this.instructionLineMap.has(currentIndex)) {
+                instructionLineIndex = this.instructionLineMap.get(currentIndex);
             }
-            this.assemblyInput.setSelectionRange(charIndex, charIndex);
-            this.assemblyInput.scrollTop = this.assemblyInput.scrollHeight * (currentIndex / Math.max(lines.length, 1));
+            
+            // If we found the line, highlight it with the ribbon
+            if (instructionLineIndex >= 0 && this.instructionRibbon && this.assemblyInput) {
+                const lineHeight = parseFloat(getComputedStyle(this.assemblyInput).lineHeight) || 25.2; // 1.8 * 14px
+                const paddingTop = parseFloat(getComputedStyle(this.assemblyInput).paddingTop) || 20;
+                const scrollTop = this.assemblyInput.scrollTop;
+                
+                // Calculate the top position of the ribbon
+                const ribbonTop = paddingTop + (instructionLineIndex * lineHeight) - scrollTop;
+                
+                // Position the ribbon
+                this.instructionRibbon.style.top = `${ribbonTop}px`;
+                this.instructionRibbon.style.display = 'block';
+                
+                // Auto-scroll to keep the instruction visible if needed
+                const lineTop = instructionLineIndex * lineHeight;
+                const textareaHeight = this.assemblyInput.clientHeight;
+                const visibleTop = scrollTop;
+                const visibleBottom = scrollTop + textareaHeight;
+                
+                if (lineTop < visibleTop || lineTop + lineHeight > visibleBottom) {
+                    // Center the line in the viewport
+                    this.assemblyInput.scrollTop = Math.max(0, lineTop - textareaHeight / 2 + lineHeight / 2);
+                    // Update ribbon position after scroll
+                    setTimeout(() => {
+                        const newScrollTop = this.assemblyInput.scrollTop;
+                        const newRibbonTop = paddingTop + (instructionLineIndex * lineHeight) - newScrollTop;
+                        this.instructionRibbon.style.top = `${newRibbonTop}px`;
+                    }, 0);
+                }
+            } else if (this.instructionRibbon) {
+                // Hide ribbon if instruction not found
+                this.instructionRibbon.style.display = 'none';
+            }
         } else {
             this.currentInstruction.textContent = 'Program finished';
+            if (this.instructionRibbon) {
+                this.instructionRibbon.style.display = 'none';
+            }
         }
     }
 

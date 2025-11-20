@@ -19,7 +19,10 @@
                     <h2>Assembly Code</h2>
                     <button id="loadBtn" class="btn btn-primary">Load</button>
                 </div>
-                <textarea id="assemblyInput" class="code-editor" placeholder="Enter ARM64 assembly code here...&#10;&#10;Example:&#10;mov x0, #5&#10;sub sp, sp, #16&#10;str x0, [sp, #8]&#10;ldr x1, [sp, #8]&#10;add sp, sp, #16&#10;ret"></textarea>
+                <div class="code-editor-wrapper">
+                    <textarea id="assemblyInput" class="code-editor" placeholder="Enter ARM64 assembly code here...&#10;&#10;Example:&#10;mov x0, #5&#10;sub sp, sp, #16&#10;str x0, [sp, #8]&#10;ldr x1, [sp, #8]&#10;add sp, sp, #16&#10;ret"></textarea>
+                    <div id="instructionRibbon" class="instruction-ribbon"></div>
+                </div>
             </div>
 
             <!-- Controls -->
